@@ -1,26 +1,202 @@
 @import "tailwindcss";
 
+/* ============================================================
+   万应 · Design Tokens
+   工业工具箱美学：暖灰纸面 + 墨色 + 朱砂主色 + 分类色编码
+   ============================================================ */
+@theme {
+  /* surfaces */
+  --color-paper: #f4f4f0;
+  --color-paper-2: #eceee9;
+  --color-card: #ffffff;
+  --color-ink: #15181e;
+  --color-ink-2: #2a2f38;
+  --color-muted: #6b7280;
+
+  /* brand */
+  --color-accent: #ff4e1b;
+  --color-accent-soft: #ffe4da;
+  --color-gold: #f0b429;
+  --color-pine: #1f6f54;
+
+  /* category coding */
+  --color-cat-encode: #2457e6;
+  --color-cat-text: #0c8f5f;
+  --color-cat-generate: #e07b0c;
+  --color-cat-media: #d23f8e;
+
+  /* fonts */
+  --font-display: var(--font-archivo), "Noto Sans SC", system-ui, sans-serif;
+  --font-sans: var(--font-noto), system-ui, -apple-system, "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, "SFMono-Regular", Consolas,
+    monospace;
+
+  --radius-xl2: 1.25rem;
+}
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  color-scheme: light;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html {
+  scroll-behavior: smooth;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: var(--color-accent);
+  color: #fff;
+}
+
+/* ---- blueprint grid backdrop ---- */
+.bg-blueprint {
+  background-image:
+    linear-gradient(to right, rgba(21, 24, 30, 0.055) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(21, 24, 30, 0.055) 1px, transparent 1px);
+  background-size: 34px 34px;
+}
+.bg-blueprint-dark {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.06) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.06) 1px, transparent 1px);
+  background-size: 34px 34px;
+}
+
+/* ---- thin scrollbars for code / textarea areas ---- */
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(21, 24, 30, 0.25) transparent;
+}
+.scroll-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: rgba(21, 24, 30, 0.22);
+  border-radius: 999px;
+}
+.scroll-thin::-webkit-scrollbar-thumb:hover {
+  background: rgba(21, 24, 30, 0.4);
+}
+
+/* ---- marquee ticker ---- */
+@keyframes marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+.animate-marquee {
+  animation: marquee 28s linear infinite;
+}
+
+/* ---- entrance ---- */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-rise {
+  animation: rise 0.6s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* ---- markdown preview ---- */
+.md-body {
+  line-height: 1.75;
+  font-size: 0.95rem;
+}
+.md-body h1,
+.md-body h2,
+.md-body h3 {
+  font-weight: 700;
+  line-height: 1.3;
+  margin: 1.2em 0 0.5em;
+}
+.md-body h1 {
+  font-size: 1.5rem;
+  border-bottom: 2px solid var(--color-paper-2);
+  padding-bottom: 0.3em;
+}
+.md-body h2 {
+  font-size: 1.25rem;
+}
+.md-body h3 {
+  font-size: 1.05rem;
+}
+.md-body p {
+  margin: 0.6em 0;
+}
+.md-body a {
+  color: var(--color-cat-encode);
+  text-decoration: underline;
+}
+.md-body code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--color-paper-2);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+}
+.md-body pre {
+  background: var(--color-ink);
+  color: #e6e8eb;
+  padding: 1em;
+  border-radius: 0.6rem;
+  overflow-x: auto;
+  margin: 0.8em 0;
+}
+.md-body pre code {
+  background: none;
+  padding: 0;
+  color: inherit;
+}
+.md-body ul,
+.md-body ol {
+  padding-left: 1.4em;
+  margin: 0.6em 0;
+}
+.md-body ul {
+  list-style: disc;
+}
+.md-body ol {
+  list-style: decimal;
+}
+.md-body blockquote {
+  border-left: 3px solid var(--color-accent);
+  padding-left: 1em;
+  color: var(--color-muted);
+  margin: 0.8em 0;
+}
+.md-body table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.8em 0;
+}
+.md-body th,
+.md-body td {
+  border: 1px solid var(--color-paper-2);
+  padding: 0.4em 0.7em;
+  text-align: left;
+}
+.md-body th {
+  background: var(--color-paper-2);
+}
+.md-body img {
+  max-width: 100%;
+  border-radius: 0.5rem;
 }
