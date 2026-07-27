@@ -75,7 +75,9 @@ function profitAtPrice(input: CalculationInput, price: Decimal): Decimal {
  * 返回 null 表示在合理区间内无解
  */
 export function solveBreakEven(input: CalculationInput): Decimal | null {
-  return binarySolve(input, new Decimal(0));
+  // 下界约束：售价必须 > 卖家折扣，否则佣金基数为负，业务无意义
+  const minPrice = input.sellerDiscount.add(new Decimal("0.01"));
+  return binarySolve(input, new Decimal(0), minPrice);
 }
 
 /**
@@ -86,7 +88,8 @@ export function solveTargetMargin(input: CalculationInput, targetMargin: Decimal
   // 净利率 = netProfit / grossRevenue = targetMargin
   // 即 netProfit = targetMargin * grossRevenue
   // 转化为求 f(price) = netProfit - targetMargin * grossRevenue = 0
-  let lo = new Decimal("0.01");
+  // 下界约束：售价必须 > 卖家折扣
+  let lo = input.sellerDiscount.add(new Decimal("0.01"));
   let hi = input.originalPrice.mul(10).add(new Decimal(1000));
 
   for (let i = 0; i < MAX_ITER; i++) {
@@ -110,8 +113,9 @@ export function solveTargetMargin(input: CalculationInput, targetMargin: Decimal
 /**
  * 通用二分求解：找到使净利润 = targetProfit 的售价
  */
-function binarySolve(input: CalculationInput, targetProfit: Decimal): Decimal | null {
-  let lo = new Decimal("0.01");
+function binarySolve(input: CalculationInput, targetProfit: Decimal, minPrice?: Decimal): Decimal | null {
+  // 下界：至少为 minPrice（确保佣金基数 > 0）
+  let lo = minPrice ?? new Decimal("0.01");
   // 上界：原价的10倍 + 1000，确保覆盖
   let hi = input.originalPrice.mul(10).add(new Decimal(1000));
 

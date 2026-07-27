@@ -80,6 +80,61 @@ function pct(v: number): Decimal {
   return d(v).div(100);
 }
 
+// ============ 输入校验 ============
+
+export interface ValidationError {
+  field: string;
+  message: string;
+}
+
+/**
+ * 校验表单输入合法性。
+ * 返回空数组表示通过；否则返回错误列表。
+ * 前端和 API 层共用此函数。
+ */
+export function validateForm(form: ProfitFormValues): ValidationError[] {
+  const errors: ValidationError[] = [];
+
+  if (form.originalPrice <= 0) errors.push({ field: "originalPrice", message: "商品原价必须大于 0" });
+  if (form.sellerDiscount < 0) errors.push({ field: "sellerDiscount", message: "卖家折扣不能为负数" });
+  if (form.sellerDiscount > form.originalPrice && form.originalPrice > 0) {
+    errors.push({ field: "sellerDiscount", message: "卖家折扣不能大于商品原价" });
+  }
+  if (form.platformDiscount < 0) errors.push({ field: "platformDiscount", message: "平台折扣不能为负数" });
+  if (form.buyerShipping < 0) errors.push({ field: "buyerShipping", message: "买家运费不能为负数" });
+  if (form.otherIncome < 0) errors.push({ field: "otherIncome", message: "其他收入不能为负数" });
+  if (!Number.isInteger(form.quantity) || form.quantity < 1) {
+    errors.push({ field: "quantity", message: "商品数量必须为正整数" });
+  }
+
+  // 成本项 >= 0
+  const costFields: (keyof ProfitFormValues)[] = [
+    "purchasePrice", "domesticShipping", "packagingCost",
+    "crossBorderLogistics", "localFulfillment", "storageCost", "otherCost",
+  ];
+  for (const f of costFields) {
+    if ((form[f] as number) < 0) errors.push({ field: f, message: `${f} 不能为负数` });
+  }
+
+  // 比例 0-100
+  if (form.affiliateRate < 0 || form.affiliateRate > 100) errors.push({ field: "affiliateRate", message: "达人佣金比例须在 0-100%" });
+  if (form.adRate < 0 || form.adRate > 100) errors.push({ field: "adRate", message: "广告成本比例须在 0-100%" });
+  if (form.refundRate < 0 || form.refundRate > 100) errors.push({ field: "refundRate", message: "退款率须在 0-100%" });
+
+  // 汇率 > 0
+  if (form.exchangeRate <= 0) errors.push({ field: "exchangeRate", message: "汇率必须大于 0" });
+
+  // 退款相关 >= 0
+  if (form.refundRecovery < 0) errors.push({ field: "refundRecovery", message: "退款回收价值不能为负" });
+  if (form.refundExtraCost < 0) errors.push({ field: "refundExtraCost", message: "退款额外成本不能为负" });
+
+  // 达人/广告固定 >= 0
+  if (form.affiliateFixed < 0) errors.push({ field: "affiliateFixed", message: "达人佣金固定不能为负" });
+  if (form.adFixed < 0) errors.push({ field: "adFixed", message: "广告固定成本不能为负" });
+
+  return errors;
+}
+
 /**
  * 将表单值构造为计算引擎输入
  * @param rules 费率规则（默认使用内置演示规则）

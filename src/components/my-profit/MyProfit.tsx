@@ -8,7 +8,9 @@ import Decimal from "decimal.js";
 import {
   DEFAULT_FORM,
   buildInput,
+  validateForm,
   type ProfitFormValues,
+  type ValidationError,
 } from "@/lib/my-profit/defaults";
 import { calculate } from "@/lib/my-profit/calculator";
 import { calculateScenarios } from "@/lib/my-profit/scenarios";
@@ -53,6 +55,7 @@ export default function MyProfit() {
     scenarios: ScenarioResult[];
   } | null>(null);
   const [dirty, setDirty] = useState(false);
+  const [validationErrors, setValidationErrors] = useState<ValidationError[]>([]);
   const [rules, setRules] = useState<RawFeeRule[] | null>(null);
   const [rateInfo, setRateInfo] = useState<{
     rate: number;
@@ -86,6 +89,13 @@ export default function MyProfit() {
   };
 
   const runCalc = () => {
+    const errors = validateForm(form);
+    if (errors.length > 0) {
+      setValidationErrors(errors);
+      setComputed(null);
+      return;
+    }
+    setValidationErrors([]);
     const input = buildInput(form, rules ?? undefined);
     const result = calculate(input);
     const scenarios = calculateScenarios(input);
@@ -101,15 +111,26 @@ export default function MyProfit() {
 
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveMsg, setSaveMsg] = useState("");
+  const [showSaveModal, setShowSaveModal] = useState(false);
+  const [saveName, setSaveName] = useState("");
+  const [saveNote, setSaveNote] = useState("");
+  const [saveUrl, setSaveUrl] = useState("");
 
-  const saveToList = async () => {
+  const openSaveModal = () => {
     if (!computed) return;
     if (status !== "authenticated") {
       router.push("/auth/login?callbackUrl=/tools/my-profit");
       return;
     }
-    const name = window.prompt("为这个选品起个名字", form.category || "未命名商品");
-    if (!name || !name.trim()) return;
+    setSaveName(form.category || "未命名商品");
+    setSaveNote("");
+    setSaveUrl("");
+    setShowSaveModal(true);
+  };
+
+  const saveToList = async () => {
+    if (!computed || !saveName.trim()) return;
+    setShowSaveModal(false);
     setSaveState("saving");
     setSaveMsg("");
     try {
@@ -118,10 +139,12 @@ export default function MyProfit() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: name.trim(),
+          name: saveName.trim(),
           category: form.category,
           shopType: form.shopType,
           bxpStatus: form.bxpStatus,
+          url: saveUrl.trim() || undefined,
+          note: saveNote.trim() || undefined,
           sku: {
             form: toPlain(form),
             result: toPlain(result),
@@ -276,11 +299,21 @@ export default function MyProfit() {
           </button>
         </div>
 
+        {validationErrors.length > 0 && (
+          <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3" data-testid="validation-errors">
+            <p className="text-xs font-bold text-red-700">输入校验未通过，请修正以下问题：</p>
+            <ul className="mt-1 list-inside list-disc text-xs text-red-600">
+              {validationErrors.map((e, i) => <li key={i}>{e.message}</li>)}
+            </ul>
+          </div>
+        )}
+
         {computed && (
           <div className="space-y-2">
             <button
-              onClick={saveToList}
+              onClick={openSaveModal}
               disabled={saveState === "saving"}
+              data-testid="save-to-list-btn"
               className="inline-flex w-full items-center justify-center gap-2 rounded-lg border-2 border-accent bg-accent/5 px-5 py-2.5 text-sm font-bold text-accent transition-colors hover:bg-accent/10 disabled:opacity-50"
             >
               <Bookmark size={15} />
@@ -298,6 +331,66 @@ export default function MyProfit() {
                 )}
               </p>
             )}
+          </div>
+        )}
+
+        {/* 保存模态框 */}
+        {showSaveModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" data-testid="save-modal">
+            <div className="w-full max-w-md rounded-xl bg-paper p-6 shadow-xl">
+              <h3 className="text-lg font-bold">保存到选品清单</h3>
+              <div className="mt-4 space-y-3">
+                <label className="block">
+                  <span className="mb-1 block text-xs font-semibold text-ink/60">商品名称 *</span>
+                  <input
+                    type="text"
+                    value={saveName}
+                    onChange={(e) => setSaveName(e.target.value)}
+                    placeholder="给这个选品起个名字"
+                    data-testid="save-name-input"
+                    className="w-full rounded-lg border border-ink/15 bg-paper/60 px-3 py-2 text-sm focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20"
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-semibold text-ink/60">商品链接</span>
+                  <input
+                    type="url"
+                    value={saveUrl}
+                    onChange={(e) => setSaveUrl(e.target.value)}
+                    placeholder="https://... (可选)"
+                    data-testid="save-url-input"
+                    className="w-full rounded-lg border border-ink/15 bg-paper/60 px-3 py-2 text-sm focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20"
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-semibold text-ink/60">备注</span>
+                  <textarea
+                    value={saveNote}
+                    onChange={(e) => setSaveNote(e.target.value)}
+                    placeholder="备注信息 (可选)"
+                    rows={2}
+                    data-testid="save-note-input"
+                    className="w-full rounded-lg border border-ink/15 bg-paper/60 px-3 py-2 text-sm focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20"
+                  />
+                </label>
+              </div>
+              <div className="mt-5 flex gap-3">
+                <button
+                  onClick={() => setShowSaveModal(false)}
+                  className="flex-1 rounded-lg border border-ink/15 px-4 py-2.5 text-sm font-semibold text-ink/70 hover:bg-ink/5"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={saveToList}
+                  disabled={!saveName.trim()}
+                  data-testid="save-confirm-btn"
+                  className="flex-1 rounded-lg bg-accent px-4 py-2.5 text-sm font-bold text-white hover:bg-accent/90 disabled:opacity-50"
+                >
+                  确认保存
+                </button>
+              </div>
+            </div>
           </div>
         )}
       </div>
