@@ -15,10 +15,11 @@ import {
   Dices,
   Image as ImageIcon,
   FileSearch,
+  TrendingUp,
   type LucideIcon,
 } from "lucide-react";
 
-export type CategoryId = "encode" | "text" | "generate" | "media" | "business";
+export type CategoryId = "encode" | "text" | "generate" | "media" | "business" | "cross-border";
 
 export interface Category {
   id: CategoryId;
@@ -97,6 +98,16 @@ export const categories: Category[] = [
     bg: "bg-[#3b5bdb]",
     soft: "bg-[#3b5bdb]/10",
     hex: "#3b5bdb",
+  },
+  {
+    id: "cross-border",
+    name: "跨境工具",
+    en: "Cross-Border",
+    tagline: "跨境电商利润测算、选品与费率分析",
+    text: "text-[#0ca678]",
+    bg: "bg-[#0ca678]",
+    soft: "bg-[#0ca678]/10",
+    hex: "#0ca678",
   },
 ];
 
@@ -255,6 +266,18 @@ export const tools: Tool[] = [
     category: "media",
     icon: ImageIcon,
     keywords: ["图片", "base64", "dataurl", "转换", "image"],
+    isNew: true,
+  },
+  // ---- cross-border ----
+  {
+    slug: "my-profit",
+    name: "马来站利润测算",
+    en: "MY Profit",
+    desc: "TikTok Shop 马来西亚站利润选品工具：匹配平台费率，测算净利润、保本价与最高采购价。",
+    category: "cross-border",
+    icon: TrendingUp,
+    keywords: ["tiktok", "马来西亚", "利润", "选品", "跨境", "费率", "保本价", "profit"],
+    hot: true,
     isNew: true,
   },
 ];

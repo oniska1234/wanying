@@ -46,6 +46,7 @@ export default function Footer() {
           <p>© {new Date().getFullYear()} 万应 WANYING · 工具让生活更简单</p>
           <p>
             默认本地浏览器计算 · AI 功能需服务端处理（使用前告知并征得同意） ·{" "}
+            <Link href="/privacy" className="text-white/60 hover:text-accent">隐私政策</Link> ·{" "}
             <span className="text-white/60">备案号占位</span>
           </p>
         </div>

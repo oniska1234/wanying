@@ -20,6 +20,7 @@ const map: Record<string, ComponentType> = {
   random: dynamic(() => import("./tools/Random")),
   "img-base64": dynamic(() => import("./tools/ImgBase64")),
   "quote-compare": dynamic(() => import("./tools/QuoteCompare")),
+  "my-profit": dynamic(() => import("./my-profit/MyProfit")),
 };
 
 export default function ToolRenderer({ slug }: { slug: string }) {

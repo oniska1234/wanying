@@ -3,6 +3,7 @@ import { Archivo_Black, Noto_Sans_SC, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import Header from "@/components/Header";
 import Footer from "@/components/Footer";
+import Providers from "@/components/Providers";
 import {
   SITE_NAME,
   SITE_NAME_FULL,
@@ -129,10 +130,12 @@ export default function RootLayout({
       className={`${archivo.variable} ${noto.variable} ${jetbrains.variable}`}
     >
       <body className="flex min-h-screen flex-col bg-paper text-ink">
-        <SiteJsonLd />
-        <Header />
-        <main className="flex-1">{children}</main>
-        <Footer />
+        <Providers>
+          <SiteJsonLd />
+          <Header />
+          <main className="flex-1">{children}</main>
+          <Footer />
+        </Providers>
       </body>
     </html>
   );
