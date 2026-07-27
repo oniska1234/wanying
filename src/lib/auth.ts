@@ -13,6 +13,9 @@ import prisma from "@/lib/prisma";
 export const { handlers, auth, signIn, signOut } = NextAuth({
   adapter: PrismaAdapter(prisma),
   session: { strategy: "jwt" },
+  // 站点部署在 Nginx 反向代理之后，需信任代理转发的 Host/Proto 头，
+  // 否则 Auth.js v5 会抛出 UntrustedHost 错误。
+  trustHost: true,
   pages: {
     signIn: "/auth/login",
   },
