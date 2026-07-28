@@ -193,7 +193,18 @@ export default function MyProfit() {
   );
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+    <div className="space-y-4">
+      {/* 选品清单入口 */}
+      <div className="flex justify-end">
+        <a
+          href="/my-profit/list"
+          className="inline-flex items-center gap-1.5 rounded-lg border border-ink/10 bg-card px-3 py-1.5 text-xs font-semibold text-ink/70 shadow-sm transition-colors hover:border-accent hover:text-accent"
+        >
+          <Bookmark size={13} /> 我的选品清单
+        </a>
+      </div>
+
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
       {/* ================= 输入区 ================= */}
       <div className="space-y-4">
         <Section title="店铺与类目" desc="决定平台费率匹配">
@@ -351,11 +362,11 @@ export default function MyProfit() {
                 }`}
               >
                 {saveMsg}
-                {saveState === "error" && /名额|升级|Pro/.test(saveMsg) && (
-                  <a href="/my-profit/list" className="ml-1 underline">查看清单</a>
-                )}
               </p>
             )}
+            <p className="text-center">
+              <a href="/my-profit/list" className="text-xs text-accent underline underline-offset-2 hover:text-accent/80">查看已保存的选品清单 →</a>
+            </p>
           </div>
         )}
 
@@ -441,6 +452,7 @@ export default function MyProfit() {
             </div>
           </div>
         )}
+      </div>
       </div>
     </div>
   );
