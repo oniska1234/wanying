@@ -11,6 +11,7 @@ interface SkuCalc {
   netMargin: number;
   breakEvenPrice: number | null;
   maxPurchasePrice: number | null;
+  resultSnapshot?: { matchLevel?: string; ruleWarning?: string };
 }
 interface ProductRow {
   id: string;
@@ -262,6 +263,9 @@ export default function ProductList({ plan }: { plan: "FREE" | "PRO" }) {
                       <div className="font-semibold">{r.name}</div>
                       <div className="mt-0.5 flex flex-wrap items-center gap-1 text-xs text-muted">
                         <span>{r.category || "通用"}</span>
+                        {calc?.resultSnapshot?.matchLevel === "default" && r.category && (
+                          <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-700" title="该类目未找到精确费率，使用通用默认费率">通用费率</span>
+                        )}
                         <span>·</span>
                         <span>{r.shopType}</span>
                         {r.tags.map((t) => (

@@ -176,8 +176,8 @@ export default function MyProfit() {
         return;
       }
       setSaveState("saved");
-      setSaveMsg("已保存到选品清单");
-      setTimeout(() => setSaveState("idle"), 2500);
+      setSaveMsg(data.warning ? `已保存到选品清单（${data.warning}）` : "已保存到选品清单");
+      setTimeout(() => setSaveState("idle"), data.warning ? 6000 : 2500);
     } catch {
       setSaveState("error");
       setSaveMsg("网络错误，保存失败");
@@ -347,7 +347,7 @@ export default function MyProfit() {
             {saveMsg && (
               <p
                 className={`text-center text-xs ${
-                  saveState === "error" ? "text-red-600" : "text-emerald-600"
+                  saveState === "error" ? "text-red-600" : saveMsg.includes("仅供参考") ? "text-amber-600" : "text-emerald-600"
                 }`}
               >
                 {saveMsg}

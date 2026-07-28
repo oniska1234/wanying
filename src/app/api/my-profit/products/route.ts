@@ -265,7 +265,7 @@ export async function POST(req: Request) {
                 calculations: {
                   create: {
                     inputSnapshot: form as unknown as object,
-                    resultSnapshot: JSON.parse(JSON.stringify({ ...serverResult, matchLevel }, (k, v) => typeof v === "object" && v !== null && v.constructor?.name === "Decimal" ? v.toString() : v)),
+                    resultSnapshot: JSON.parse(JSON.stringify({ ...serverResult, matchLevel, ...(categoryWarning ? { ruleWarning: categoryWarning } : {}) }, (k, v) => typeof v === "object" && v !== null && v.constructor?.name === "Decimal" ? v.toString() : v)),
                     feeRuleVersion: serverResult.feeRuleVersions?.join(",") || null,
                     exchangeRateValue: Number(form.exchangeRate) || 1,
                     netProfit: serverResult.netProfit.toNumber(),
