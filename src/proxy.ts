@@ -19,7 +19,7 @@ function hasSession(req: NextRequest): boolean {
 }
 
 /** 需要登录才能访问的路径前缀 */
-const PROTECTED_PREFIXES = ["/my-profit/list", "/my-profit/settings", "/admin"];
+const PROTECTED_PREFIXES = ["/my-profit/list", "/my-profit/import", "/my-profit/settings", "/admin"];
 
 export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
@@ -46,5 +46,5 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/quote-compare", "/my-profit/list/:path*", "/my-profit/settings/:path*", "/admin/:path*"],
+  matcher: ["/quote-compare", "/my-profit/list/:path*", "/my-profit/import/:path*", "/my-profit/settings/:path*", "/admin/:path*"],
 };

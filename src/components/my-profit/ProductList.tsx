@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import {
-  Search, Download, Trash2, PackageOpen, Tag, StickyNote, RefreshCw, Plus,
+  Search, Download, Upload, Trash2, PackageOpen, Tag, StickyNote, RefreshCw, Plus,
 } from "lucide-react";
 
 interface SkuCalc {
@@ -196,6 +196,12 @@ export default function ProductList({ plan }: { plan: "FREE" | "PRO" }) {
         >
           <Download size={15} /> 导出
         </button>
+        <Link
+          href="/my-profit/import"
+          className="inline-flex items-center gap-1.5 rounded-lg border border-ink/15 bg-card px-3 py-2 text-sm font-semibold hover:bg-ink/5"
+        >
+          <Upload size={15} /> 导入
+        </Link>
         <Link
           href="/tools/my-profit"
           className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-2 text-sm font-bold text-white hover:bg-accent/90"

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useState, useRef, useEffect } from "react";
 import { useSession, signOut } from "next-auth/react";
-import { Menu, X, Sparkles, User, LogOut, Settings, ListChecks, ChevronDown, Crown } from "lucide-react";
+import { Menu, X, Sparkles, User, LogOut, Settings, ListChecks, ChevronDown, Crown, Upload } from "lucide-react";
 import { categories } from "@/lib/tools";
 
 /** 登录后右上角用户菜单 */
@@ -47,6 +47,13 @@ function UserMenu() {
               className="flex items-center gap-2.5 px-4 py-2.5 text-sm hover:bg-ink/5"
             >
               <ListChecks size={15} /> 选品清单
+            </Link>
+            <Link
+              href="/my-profit/import"
+              onClick={() => setOpen(false)}
+              className="flex items-center gap-2.5 px-4 py-2.5 text-sm hover:bg-ink/5"
+            >
+              <Upload size={15} /> 批量导入
             </Link>
             <Link
               href="/my-profit/settings"

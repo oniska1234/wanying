@@ -195,7 +195,13 @@ export default function MyProfit() {
   return (
     <div className="space-y-4">
       {/* 选品清单入口 */}
-      <div className="flex justify-end">
+      <div className="flex justify-end gap-2">
+        <a
+          href="/my-profit/import"
+          className="inline-flex items-center gap-1.5 rounded-lg border border-ink/10 bg-card px-3 py-1.5 text-xs font-semibold text-ink/70 shadow-sm transition-colors hover:border-accent hover:text-accent"
+        >
+          <Bookmark size={13} /> 批量导入
+        </a>
         <a
           href="/my-profit/list"
           className="inline-flex items-center gap-1.5 rounded-lg border border-ink/10 bg-card px-3 py-1.5 text-xs font-semibold text-ink/70 shadow-sm transition-colors hover:border-accent hover:text-accent"
