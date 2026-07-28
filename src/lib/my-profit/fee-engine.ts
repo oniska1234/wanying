@@ -66,6 +66,7 @@ export function matchFeeRules(
     transaction: null,
     platformSupport: null,
     hasUnmatched: false,
+    matchLevel: "default",
     overrides: {},
   };
 
@@ -74,7 +75,7 @@ export function matchFeeRules(
 
   for (const feeType of feeTypes) {
     const candidates = effective.filter((r) => r.feeType === feeType);
-    const matched = findBestMatch(candidates, category);
+    const { rule: matched, score } = findBestMatchWithScore(candidates, category);
 
     if (matched) {
       const ruleMatch: FeeRuleMatch = {
@@ -87,8 +88,13 @@ export function matchFeeRules(
         effectiveFrom: matched.effectiveFrom,
       };
 
-      if (feeType === "COMMISSION") result.commission = ruleMatch;
-      else if (feeType === "TRANSACTION") result.transaction = ruleMatch;
+      if (feeType === "COMMISSION") {
+        result.commission = ruleMatch;
+        // 确定匹配级别
+        if (score >= 2) result.matchLevel = "exact";
+        else if (score === 1) result.matchLevel = "parent";
+        else result.matchLevel = "default";
+      } else if (feeType === "TRANSACTION") result.transaction = ruleMatch;
       else result.platformSupport = ruleMatch;
     } else {
       result.hasUnmatched = true;
@@ -99,12 +105,12 @@ export function matchFeeRules(
 }
 
 /**
- * 在候选规则中找最佳匹配
+ * 在候选规则中找最佳匹配（返回规则和分数）
  * 优先级：精确类目 > 父类目 > 默认（空类目）
  * 同类目取最新版本
  */
-function findBestMatch(candidates: RawFeeRule[], category: string): RawFeeRule | null {
-  if (candidates.length === 0) return null;
+function findBestMatchWithScore(candidates: RawFeeRule[], category: string): { rule: RawFeeRule | null; score: number } {
+  if (candidates.length === 0) return { rule: null, score: -1 };
 
   // 按类目匹配深度排序
   const scored = candidates.map((rule) => ({
@@ -114,7 +120,7 @@ function findBestMatch(candidates: RawFeeRule[], category: string): RawFeeRule |
 
   // 过滤掉完全不匹配的（score = -1）
   const matched = scored.filter((s) => s.score >= 0);
-  if (matched.length === 0) return null;
+  if (matched.length === 0) return { rule: null, score: -1 };
 
   // 按 score 降序，同 score 按 version 降序
   matched.sort((a, b) => {
@@ -122,7 +128,7 @@ function findBestMatch(candidates: RawFeeRule[], category: string): RawFeeRule |
     return b.rule.version - a.rule.version;
   });
 
-  return matched[0].rule;
+  return { rule: matched[0].rule, score: matched[0].score };
 }
 
 /**

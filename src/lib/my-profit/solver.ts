@@ -89,11 +89,25 @@ export function solveTargetMargin(input: CalculationInput, targetMargin: Decimal
   // 即 netProfit = targetMargin * grossRevenue
   // 转化为求 f(price) = netProfit - targetMargin * grossRevenue = 0
   // 下界约束：售价必须 > 卖家折扣
-  let lo = input.sellerDiscount.add(new Decimal("0.01"));
-  let hi = input.originalPrice.mul(10).add(new Decimal(1000));
+  const lo = input.sellerDiscount.add(new Decimal("0.01"));
+  const hi = input.originalPrice.mul(10).add(new Decimal(1000));
 
+  // 先检查下界是否已满足目标利润率
+  const profitAtLo = profitAtPrice(input, lo);
+  const grossAtLo = lo.sub(input.sellerDiscount).add(input.buyerShipping).add(input.otherIncome);
+  const targetAtLo = grossAtLo.mul(targetMargin);
+  if (grossAtLo.gt(0) && profitAtLo.gte(targetAtLo)) return lo;
+
+  // 检查上界是否能达到目标
+  const profitAtHi = profitAtPrice(input, hi);
+  const grossAtHi = hi.sub(input.sellerDiscount).add(input.buyerShipping).add(input.otherIncome);
+  const targetAtHi = grossAtHi.mul(targetMargin);
+  if (profitAtHi.lt(targetAtHi)) return null;
+
+  let loBound = lo;
+  let hiBound = hi;
   for (let i = 0; i < MAX_ITER; i++) {
-    const mid = lo.add(hi).div(2);
+    const mid = loBound.add(hiBound).div(2);
     const profit = profitAtPrice(input, mid);
     const gross = mid.sub(input.sellerDiscount).add(input.buyerShipping).add(input.otherIncome);
     const target = gross.mul(targetMargin);
@@ -101,13 +115,13 @@ export function solveTargetMargin(input: CalculationInput, targetMargin: Decimal
 
     if (diff.abs().lt(PRECISION)) return mid;
     if (diff.lt(0)) {
-      lo = mid;
+      loBound = mid;
     } else {
-      hi = mid;
+      hiBound = mid;
     }
   }
 
-  return null;
+  return loBound.add(hiBound).div(2);
 }
 
 /**

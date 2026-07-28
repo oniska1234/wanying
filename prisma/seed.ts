@@ -23,8 +23,8 @@ const SOURCE = {
 const COMMISSION_EFFECTIVE = new Date("2025-09-13T00:00:00+08:00");
 /** 交易费生效日期：2024-09-05 费率调整为 3.78% */
 const TRANSACTION_EFFECTIVE = new Date("2024-09-05T00:00:00+08:00");
-/** 平台支持费生效日期 */
-const PSF_EFFECTIVE = new Date("2024-09-05T00:00:00+08:00");
+/** 平台支持费生效日期：2026-02-15 RM0.54 新费率生效 */
+const PSF_EFFECTIVE = new Date("2026-02-15T00:00:00+08:00");
 
 interface SeedRule {
   feeType: FeeType;

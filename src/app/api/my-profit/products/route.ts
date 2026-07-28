@@ -165,6 +165,7 @@ export async function POST(req: Request) {
 
   // === P1-002: 服务端重新计算利润 ===
   let serverResult: ReturnType<typeof calculate>;
+  let matchLevel: "exact" | "parent" | "default" = "default";
   try {
     // 从数据库加载当前费率规则
     const dbRules = await prisma.feeRule.findMany({
@@ -186,6 +187,7 @@ export async function POST(req: Request) {
       source: r.source,
     }));
     const input = buildInput(form, rules);
+    matchLevel = input.feeRules.matchLevel;
     serverResult = calculate(input);
   } catch (e) {
     return NextResponse.json(
@@ -193,6 +195,11 @@ export async function POST(req: Request) {
       { status: 400 }
     );
   }
+
+  // === P1-002: 未知类目警告 ===
+  const categoryWarning = (body.category && body.category.trim() !== "" && matchLevel === "default")
+    ? "该类目未找到精确费率规则，已使用通用默认费率，利润结果仅供参考"
+    : undefined;
 
   // === P1-001: 事务内额度检查 + 创建（防止并发竞态） ===
   const MAX_RETRIES = 3;
@@ -258,7 +265,7 @@ export async function POST(req: Request) {
                 calculations: {
                   create: {
                     inputSnapshot: form as unknown as object,
-                    resultSnapshot: JSON.parse(JSON.stringify(serverResult, (k, v) => typeof v === "object" && v !== null && v.constructor?.name === "Decimal" ? v.toString() : v)),
+                    resultSnapshot: JSON.parse(JSON.stringify({ ...serverResult, matchLevel }, (k, v) => typeof v === "object" && v !== null && v.constructor?.name === "Decimal" ? v.toString() : v)),
                     feeRuleVersion: serverResult.feeRuleVersions?.join(",") || null,
                     exchangeRateValue: Number(form.exchangeRate) || 1,
                     netProfit: serverResult.netProfit.toNumber(),
@@ -273,7 +280,7 @@ export async function POST(req: Request) {
         });
       }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
 
-      return NextResponse.json({ ok: true, id: product.id });
+      return NextResponse.json({ ok: true, id: product.id, matchLevel, ...(categoryWarning ? { warning: categoryWarning } : {}) });
     } catch (e) {
       if (e instanceof QuotaExceededError) {
         return NextResponse.json(

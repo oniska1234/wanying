@@ -33,6 +33,8 @@ export interface FeeMatchResult {
   platformSupport: FeeRuleMatch | null;
   /** 是否有未匹配的规则（需用户手工输入） */
   hasUnmatched: boolean;
+  /** 佣金类目匹配级别：exact=精确子类目, parent=父类目, default=通用默认 */
+  matchLevel: "exact" | "parent" | "default";
   /** 用户自定义覆盖 */
   overrides: Partial<Record<FeeType, { rate?: Decimal; fixedAmount?: Decimal }>>;
 }
