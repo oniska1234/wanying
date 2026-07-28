@@ -197,11 +197,14 @@ export async function POST(req: Request) {
   // === P1-001: 事务内额度检查 + 创建（防止并发竞态） ===
   try {
     const product = await prisma.$transaction(async (tx) => {
-      // 行级锁定：统计当前用户商品数
-      const countResult = await tx.$queryRaw<[{ count: bigint }]>`
-        SELECT COUNT(*)::bigint as count FROM "Product" WHERE "userId" = ${session.user!.id} FOR UPDATE
-      `;
-      const currentCount = Number(countResult[0].count);
+      // 用户级咨询锁：序列化同一用户的并发创建请求（事务结束自动释放）
+      const lockKey = BigInt("0x" + Buffer.from(session.user!.id.slice(0, 12)).toString("hex").slice(0, 15));
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(${lockKey})`;
+
+      // 统计当前用户商品数（已被咨询锁保护，无竞态）
+      const currentCount = await tx.product.count({
+        where: { userId: session.user!.id },
+      });
 
       // 额度检查
       const plan = await tx.subscription.findFirst({
@@ -257,7 +260,7 @@ export async function POST(req: Request) {
                   feeRuleVersion: serverResult.feeRuleVersions?.join(",") || null,
                   exchangeRateValue: Number(form.exchangeRate) || 1,
                   netProfit: serverResult.netProfit.toNumber(),
-                  netMargin: serverResult.netMargin.toNumber(),
+                  netMargin: Math.max(-9.9999, Math.min(9.9999, serverResult.netMargin.toNumber())),
                   breakEvenPrice: serverResult.breakEvenPrice?.toNumber() ?? null,
                   maxPurchasePrice: serverResult.maxPurchasePrice?.toNumber() ?? null,
                 },
