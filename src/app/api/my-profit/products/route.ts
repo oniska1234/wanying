@@ -198,8 +198,8 @@ export async function POST(req: Request) {
   try {
     const product = await prisma.$transaction(async (tx) => {
       // 用户级咨询锁：序列化同一用户的并发创建请求（事务结束自动释放）
-      const lockKey = BigInt("0x" + Buffer.from(session.user!.id.slice(0, 12)).toString("hex").slice(0, 15));
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(${lockKey})`;
+      const lockKey = BigInt(parseInt(session.user!.id.replace(/[^0-9a-f]/gi, "").slice(0, 14), 16) % Number.MAX_SAFE_INTEGER);
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey}::bigint)`;
 
       // 统计当前用户商品数（已被咨询锁保护，无竞态）
       const currentCount = await tx.product.count({
