@@ -44,6 +44,7 @@ interface RowError {
 }
 
 interface ParsedRow {
+  excelRow: number; // 真实 Excel 行号
   name: string;
   form: ProfitFormValues;
   category: string;
@@ -86,6 +87,11 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "请上传 Excel 文件" }, { status: 400 });
   }
 
+  // P2: 文件扩展名校验
+  if (!/\.(xlsx|xls)$/i.test(file.name)) {
+    return NextResponse.json({ error: "仅支持 .xlsx 或 .xls 格式的 Excel 文件" }, { status: 400 });
+  }
+
   // 读取文件
   let wb: XLSX.WorkBook;
   try {
@@ -110,6 +116,17 @@ export async function POST(req: Request) {
   for (let i = 0; i < headerRow.length; i++) {
     const h = String(headerRow[i]).trim();
     colMap[i] = headerKeys.indexOf(h);
+  }
+
+  // P2: 文件级表头校验——必须包含必填列
+  const REQUIRED_HEADERS = ["商品名称", "商品原价(RM)"];
+  const foundHeaders = new Set(headerRow.map((h) => String(h).trim()));
+  const missingHeaders = REQUIRED_HEADERS.filter((h) => !foundHeaders.has(h));
+  if (missingHeaders.length > 0) {
+    return NextResponse.json(
+      { error: `表头校验失败，缺少必需列：${missingHeaders.join("、")}。请下载最新模板填写。` },
+      { status: 400 }
+    );
   }
 
   // 跳过表头行 + 示例行/说明行（如果第二行包含"必填"或"示例"则跳过）
@@ -154,6 +171,59 @@ export async function POST(req: Request) {
       errors.push({ row: rowNum, field: "商品名称", message: "商品名称必填" });
       continue;
     }
+    // P1: 名称超长禁止静默截断
+    if (name.length > 100) {
+      errors.push({ row: rowNum, field: "商品名称", message: `商品名称不能超过 100 字（当前 ${name.length} 字）` });
+      continue;
+    }
+
+    // P1: 数量必须为正整数，禁止静默转换
+    const rawQty = values["数量"];
+    let quantity = 1;
+    if (rawQty !== null && rawQty !== undefined && rawQty !== "") {
+      const nQty = Number(rawQty);
+      if (!Number.isFinite(nQty) || nQty < 1 || !Number.isInteger(nQty)) {
+        errors.push({ row: rowNum, field: "数量", message: `数量必须为正整数（当前值: ${rawQty}）` });
+        continue;
+      }
+      quantity = nQty;
+    }
+
+    // P1: 成本币种必须为 CNY/MYR
+    const rawCurrency = str(values["成本币种"], "");
+    let costCurrency: "CNY" | "MYR" = "CNY";
+    if (rawCurrency) {
+      const upper = rawCurrency.toUpperCase();
+      if (upper !== "CNY" && upper !== "MYR") {
+        errors.push({ row: rowNum, field: "成本币种", message: `成本币种仅支持 CNY 或 MYR（当前值: ${rawCurrency}）` });
+        continue;
+      }
+      costCurrency = upper as "CNY" | "MYR";
+    }
+
+    // P1: 店铺类型必须为 MARKETPLACE/MALL
+    const rawShop = str(values["店铺类型"], "");
+    let shopType: "MARKETPLACE" | "MALL" = "MARKETPLACE";
+    if (rawShop) {
+      const upper = rawShop.toUpperCase();
+      if (upper !== "MARKETPLACE" && upper !== "MALL") {
+        errors.push({ row: rowNum, field: "店铺类型", message: `店铺类型仅支持 MARKETPLACE 或 MALL（当前值: ${rawShop}）` });
+        continue;
+      }
+      shopType = upper as "MARKETPLACE" | "MALL";
+    }
+
+    // P1: BXP 状态必须为 BXP/NON_BXP/UNCERTAIN
+    const rawBxp = str(values["BXP状态"], "");
+    let bxpStatus: "BXP" | "NON_BXP" | "UNCERTAIN" = "NON_BXP";
+    if (rawBxp) {
+      const upper = rawBxp.toUpperCase();
+      if (upper !== "BXP" && upper !== "NON_BXP" && upper !== "UNCERTAIN") {
+        errors.push({ row: rowNum, field: "BXP状态", message: `BXP状态仅支持 BXP、NON_BXP 或 UNCERTAIN（当前值: ${rawBxp}）` });
+        continue;
+      }
+      bxpStatus = upper as "BXP" | "NON_BXP" | "UNCERTAIN";
+    }
 
     const form: ProfitFormValues = {
       originalPrice: num(values["商品原价(RM)"], 0),
@@ -161,8 +231,8 @@ export async function POST(req: Request) {
       platformDiscount: num(values["平台折扣(RM)"], 0),
       buyerShipping: num(values["买家运费(RM)"], 0),
       otherIncome: 0,
-      quantity: Math.max(1, Math.round(num(values["数量"], 1))),
-      costCurrency: (str(values["成本币种"], "CNY").toUpperCase() === "MYR" ? "MYR" : "CNY") as "CNY" | "MYR",
+      quantity,
+      costCurrency,
       purchasePrice: num(values["采购成本"], 0),
       domesticShipping: num(values["国内运费"], 0),
       packagingCost: num(values["包材费"], 0),
@@ -178,13 +248,8 @@ export async function POST(req: Request) {
       refundRecovery: 0,
       refundExtraCost: 0,
       exchangeRate: num(values["汇率(CNY/MYR)"], 1.62),
-      shopType: (str(values["店铺类型"], "MARKETPLACE").toUpperCase() === "MALL" ? "MALL" : "MARKETPLACE") as "MARKETPLACE" | "MALL",
-      bxpStatus: (() => {
-        const v = str(values["BXP状态"], "NON_BXP").toUpperCase();
-        if (v === "BXP") return "BXP" as const;
-        if (v === "UNCERTAIN") return "UNCERTAIN" as const;
-        return "NON_BXP" as const;
-      })(),
+      shopType,
+      bxpStatus,
       category: str(values["类目"], ""),
     };
 
@@ -198,7 +263,8 @@ export async function POST(req: Request) {
     }
 
     parsed.push({
-      name: name.slice(0, 100),
+      excelRow: rowNum,
+      name,
       form,
       category: form.category,
       shopType: form.shopType,
@@ -238,7 +304,7 @@ export async function POST(req: Request) {
       const result = calculate(input);
       calcResults.push({ row, result, matchLevel: input.feeRules.matchLevel });
     } catch {
-      errors.push({ row: 0, field: "calculation", message: `${row.name}: 计算失败` });
+      errors.push({ row: row.excelRow, field: "calculation", message: `${row.name}: 计算失败` });
     }
   }
 
@@ -266,7 +332,7 @@ export async function POST(req: Request) {
       if (calcResults.length > remaining) {
         quotaHit = true;
         for (let i = remaining; i < calcResults.length; i++) {
-          errors.push({ row: 0, field: "quota", message: `${calcResults[i].row.name}: 超出免费额度（最多 ${FREE_LIMITS.maxProducts} 条）` });
+          errors.push({ row: calcResults[i].row.excelRow, field: "quota", message: `${calcResults[i].row.name}: 超出免费额度（最多 ${FREE_LIMITS.maxProducts} 条），仅保存前 ${remaining} 条` });
         }
       }
 
@@ -334,11 +400,14 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "批量保存失败，请重试" }, { status: 500 });
   }
 
+  const errorsTotal = errors.length;
   return NextResponse.json({
     total: dataRows.length,
     success: successCount,
     failed: dataRows.length - successCount,
-    errors: errors.slice(0, 50), // 最多返回50条错误
+    errors: errors.slice(0, 50),
+    errorsTotal,
+    errorsTruncated: errorsTotal > 50,
     quotaHit,
   });
 }
