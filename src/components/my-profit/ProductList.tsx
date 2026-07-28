@@ -53,6 +53,9 @@ export default function ProductList({ plan }: { plan: "FREE" | "PRO" }) {
   const [sort, setSort] = useState("updatedAt_desc");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [msg, setMsg] = useState("");
+  // 编辑弹窗状态
+  const [editModal, setEditModal] = useState<{ type: "tags" | "note"; row: ProductRow } | null>(null);
+  const [editValue, setEditValue] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -87,26 +90,28 @@ export default function ProductList({ plan }: { plan: "FREE" | "PRO" }) {
     });
   };
 
-  const editTags = async (row: ProductRow) => {
-    const input = window.prompt("标签（用逗号分隔）", row.tags.join(","));
-    if (input === null) return;
-    const tags = input.split(/[,，]/).map((t) => t.trim()).filter(Boolean);
-    await fetch(`/api/my-profit/products/${row.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tags }),
-    });
-    load();
+  const editTags = (row: ProductRow) => {
+    setEditModal({ type: "tags", row });
+    setEditValue(row.tags.join(", "));
   };
 
-  const editNote = async (row: ProductRow) => {
-    const input = window.prompt("备注", row.note || "");
-    if (input === null) return;
+  const editNote = (row: ProductRow) => {
+    setEditModal({ type: "note", row });
+    setEditValue(row.note || "");
+  };
+
+  const saveEdit = async () => {
+    if (!editModal) return;
+    const { type, row } = editModal;
+    const payload = type === "tags"
+      ? { tags: editValue.split(/[,，]/).map((t) => t.trim()).filter(Boolean) }
+      : { note: editValue };
     await fetch(`/api/my-profit/products/${row.id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ note: input }),
+      body: JSON.stringify(payload),
     });
+    setEditModal(null);
     load();
   };
 
@@ -301,6 +306,54 @@ export default function ProductList({ plan }: { plan: "FREE" | "PRO" }) {
               })}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* 编辑标签/备注弹窗 */}
+      {editModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" data-testid={`edit-${editModal.type}-modal`}>
+          <div className="w-full max-w-sm rounded-xl bg-white p-5 shadow-xl">
+            <h3 className="text-base font-bold">
+              {editModal.type === "tags" ? "编辑标签" : "编辑备注"}
+            </h3>
+            <p className="mt-1 text-xs text-gray-500">{editModal.row.name}</p>
+            {editModal.type === "tags" ? (
+              <input
+                type="text"
+                value={editValue}
+                onChange={(e) => setEditValue(e.target.value)}
+                placeholder="用逗号分隔多个标签"
+                data-testid="edit-tags-input"
+                className="mt-3 w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                autoFocus
+              />
+            ) : (
+              <textarea
+                value={editValue}
+                onChange={(e) => setEditValue(e.target.value)}
+                placeholder="备注信息"
+                rows={3}
+                data-testid="edit-note-input"
+                className="mt-3 w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                autoFocus
+              />
+            )}
+            <div className="mt-4 flex gap-2">
+              <button
+                onClick={() => setEditModal(null)}
+                className="flex-1 rounded-lg border border-gray-200 px-3 py-2 text-sm font-medium text-gray-600 hover:bg-gray-50"
+              >
+                取消
+              </button>
+              <button
+                onClick={saveEdit}
+                data-testid="edit-save-btn"
+                className="flex-1 rounded-lg bg-blue-600 px-3 py-2 text-sm font-bold text-white hover:bg-blue-700"
+              >
+                保存
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

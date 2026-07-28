@@ -160,8 +160,9 @@ export function calculate(input: CalculationInput): CalculationResult {
 
   // ========== 3. 计算到手收入 ==========
 
-  // 总交易额 = 原价 - 卖家折扣 - 平台折扣 + 买家运费 + 其他收入
-  const grossRevenue = originalPrice.sub(sellerDiscount).sub(platformDiscount).add(buyerShipping).add(otherIncome);
+  // 总交易额 = 原价 - 卖家折扣 + 买家运费 + 其他收入
+  // 注意：平台折扣由平台资助，不从卖家收入中扣除
+  const grossRevenue = originalPrice.sub(sellerDiscount).add(buyerShipping).add(otherIncome);
 
   // 预计到手收入 = 总交易额 - 平台总费用
   const netRevenue = grossRevenue.sub(totalPlatformFees);
@@ -305,7 +306,8 @@ function calculateCore(input: CalculationInput): Omit<CalculationResult, "breakE
     }
   }
 
-  const grossRevenue = originalPrice.sub(sellerDiscount).sub(platformDiscount).add(buyerShipping).add(otherIncome);
+  // 平台折扣由平台资助，不从卖家收入中扣除
+  const grossRevenue = originalPrice.sub(sellerDiscount).add(buyerShipping).add(otherIncome);
   const netRevenue = grossRevenue.sub(totalPlatformFees);
 
   const cogsItems = [input.purchasePrice, input.domesticShipping, input.packagingCost, input.crossBorderLogistics, input.localFulfillment, input.storageCost, input.otherCost];

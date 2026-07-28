@@ -16,7 +16,7 @@ const MAX_ITER = 100;
  */
 function profitAtPrice(input: CalculationInput, price: Decimal): Decimal {
   const {
-    sellerDiscount, platformDiscount, buyerShipping, otherIncome,
+    sellerDiscount, buyerShipping, otherIncome,
     quantity, costCurrency, exchangeRate, feeRules,
   } = input;
 
@@ -51,8 +51,8 @@ function profitAtPrice(input: CalculationInput, price: Decimal): Decimal {
     if (psfRule.fixedAmount) totalFees = totalFees.add(psfRule.fixedAmount);
   }
 
-  // 到手收入
-  const grossRevenue = price.sub(sellerDiscount).sub(platformDiscount).add(buyerShipping).add(otherIncome);
+  // 到手收入（平台折扣由平台资助，不扣减卖家收入）
+  const grossRevenue = price.sub(sellerDiscount).add(buyerShipping).add(otherIncome);
   const netRevenue = grossRevenue.sub(totalFees);
 
   // 成本 (转 MYR)
@@ -95,7 +95,7 @@ export function solveTargetMargin(input: CalculationInput, targetMargin: Decimal
   for (let i = 0; i < MAX_ITER; i++) {
     const mid = lo.add(hi).div(2);
     const profit = profitAtPrice(input, mid);
-    const gross = mid.sub(input.sellerDiscount).sub(input.platformDiscount).add(input.buyerShipping).add(input.otherIncome);
+    const gross = mid.sub(input.sellerDiscount).add(input.buyerShipping).add(input.otherIncome);
     const target = gross.mul(targetMargin);
     const diff = profit.sub(target);
 

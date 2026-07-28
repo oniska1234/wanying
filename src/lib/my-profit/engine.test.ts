@@ -5,7 +5,7 @@
  */
 import { describe, it, expect } from "vitest";
 import Decimal from "decimal.js";
-import { matchFeeRules, DEMO_FEE_RULES, type RawFeeRule } from "./fee-engine";
+import { matchFeeRules, type RawFeeRule } from "./fee-engine";
 import { calculate } from "./calculator";
 import { solveBreakEven, solveTargetMargin } from "./solver";
 import { calculateScenarios, DEFAULT_SCENARIOS } from "./scenarios";
@@ -18,30 +18,44 @@ function near(actual: Decimal, expected: number, tol = TOL) {
   expect(Math.abs(actual.toNumber() - expected)).toBeLessThanOrEqual(tol);
 }
 
+/** 测试用费率规则（固定已知值，便于手工验证） */
+const TEST_FEE_RULES: RawFeeRule[] = [
+  { id: "t-comm-mp", site: "MY", feeType: "COMMISSION", category: "*", shopType: "MARKETPLACE", bxpStatus: "NON_BXP", rate: 0.05, fixedAmount: null, perUnit: "REVENUE", effectiveFrom: "2024-01-01T00:00:00Z", effectiveTo: null, version: 2, source: "test" },
+  { id: "t-comm-mp-bxp", site: "MY", feeType: "COMMISSION", category: "*", shopType: "MARKETPLACE", bxpStatus: "BXP", rate: 0.04, fixedAmount: null, perUnit: "REVENUE", effectiveFrom: "2024-01-01T00:00:00Z", effectiveTo: null, version: 2, source: "test" },
+  { id: "t-comm-mall", site: "MY", feeType: "COMMISSION", category: "*", shopType: "MALL", bxpStatus: "NON_BXP", rate: 0.06, fixedAmount: null, perUnit: "REVENUE", effectiveFrom: "2024-01-01T00:00:00Z", effectiveTo: null, version: 2, source: "test" },
+  { id: "t-comm-elec", site: "MY", feeType: "COMMISSION", category: "Electronics", shopType: "MARKETPLACE", bxpStatus: "NON_BXP", rate: 0.06, fixedAmount: null, perUnit: "REVENUE", effectiveFrom: "2024-01-01T00:00:00Z", effectiveTo: null, version: 2, source: "test" },
+  { id: "t-txn-mp", site: "MY", feeType: "TRANSACTION", category: "*", shopType: "MARKETPLACE", bxpStatus: "NON_BXP", rate: 0.02, fixedAmount: null, perUnit: "REVENUE", effectiveFrom: "2024-01-01T00:00:00Z", effectiveTo: null, version: 2, source: "test" },
+  { id: "t-txn-bxp", site: "MY", feeType: "TRANSACTION", category: "*", shopType: "MARKETPLACE", bxpStatus: "BXP", rate: 0.02, fixedAmount: null, perUnit: "REVENUE", effectiveFrom: "2024-01-01T00:00:00Z", effectiveTo: null, version: 2, source: "test" },
+  { id: "t-txn-mall", site: "MY", feeType: "TRANSACTION", category: "*", shopType: "MALL", bxpStatus: "NON_BXP", rate: 0.02, fixedAmount: null, perUnit: "REVENUE", effectiveFrom: "2024-01-01T00:00:00Z", effectiveTo: null, version: 2, source: "test" },
+  { id: "t-psf-mp", site: "MY", feeType: "PLATFORM_SUPPORT", category: "*", shopType: "MARKETPLACE", bxpStatus: "NON_BXP", rate: null, fixedAmount: 1.0, perUnit: "ORDER", effectiveFrom: "2024-01-01T00:00:00Z", effectiveTo: null, version: 2, source: "test" },
+  { id: "t-psf-bxp", site: "MY", feeType: "PLATFORM_SUPPORT", category: "*", shopType: "MARKETPLACE", bxpStatus: "BXP", rate: null, fixedAmount: 1.0, perUnit: "ORDER", effectiveFrom: "2024-01-01T00:00:00Z", effectiveTo: null, version: 2, source: "test" },
+  { id: "t-psf-mall", site: "MY", feeType: "PLATFORM_SUPPORT", category: "*", shopType: "MALL", bxpStatus: "NON_BXP", rate: null, fixedAmount: 1.5, perUnit: "ORDER", effectiveFrom: "2024-01-01T00:00:00Z", effectiveTo: null, version: 2, source: "test" },
+];
+
 // ============ 费率匹配 ============
 
 describe("fee-engine: matchFeeRules", () => {
   it("Marketplace 非BXP 匹配默认佣金 5%", () => {
-    const r = matchFeeRules(DEMO_FEE_RULES, "MY", "", "MARKETPLACE", "NON_BXP");
+    const r = matchFeeRules(TEST_FEE_RULES, "MY", "", "MARKETPLACE", "NON_BXP");
     expect(r.commission).not.toBeNull();
     near(r.commission!.rate!, 0.05);
     expect(r.hasUnmatched).toBe(false);
   });
 
   it("Marketplace BXP 匹配更低佣金 4%", () => {
-    const r = matchFeeRules(DEMO_FEE_RULES, "MY", "", "MARKETPLACE", "BXP");
+    const r = matchFeeRules(TEST_FEE_RULES, "MY", "", "MARKETPLACE", "BXP");
     near(r.commission!.rate!, 0.04);
   });
 
   it("Mall 匹配更高佣金 6%", () => {
-    const r = matchFeeRules(DEMO_FEE_RULES, "MY", "", "MALL", "NON_BXP");
+    const r = matchFeeRules(TEST_FEE_RULES, "MY", "", "MALL", "NON_BXP");
     near(r.commission!.rate!, 0.06);
   });
 
   it("精确子类目优先于父类目/默认", () => {
     // Electronics 类目佣金 6%（高于默认 5%）
     const r = matchFeeRules(
-      DEMO_FEE_RULES,
+      TEST_FEE_RULES,
       "MY",
       "Electronics > Phones",
       "MARKETPLACE",
@@ -51,12 +65,12 @@ describe("fee-engine: matchFeeRules", () => {
   });
 
   it("UNCERTAIN BXP 回退到 NON_BXP（更保守）", () => {
-    const r = matchFeeRules(DEMO_FEE_RULES, "MY", "", "MARKETPLACE", "UNCERTAIN");
+    const r = matchFeeRules(TEST_FEE_RULES, "MY", "", "MARKETPLACE", "UNCERTAIN");
     near(r.commission!.rate!, 0.05);
   });
 
   it("平台支持费为按订单固定金额", () => {
-    const r = matchFeeRules(DEMO_FEE_RULES, "MY", "", "MARKETPLACE", "NON_BXP");
+    const r = matchFeeRules(TEST_FEE_RULES, "MY", "", "MARKETPLACE", "NON_BXP");
     expect(r.platformSupport).not.toBeNull();
     expect(r.platformSupport!.rate).toBeNull();
     near(r.platformSupport!.fixedAmount!, 1.0);
@@ -131,66 +145,66 @@ describe("calculator: calculate", () => {
   };
 
   it("平台费合计 = 佣金+交易费+平台支持费", () => {
-    const input = buildInput(baseForm);
+    const input = buildInput(baseForm, TEST_FEE_RULES);
     const r = calculate(input);
     near(r.totalPlatformFees, 8); // 5 + 2 + 1
   });
 
   it("到手收入 = 总交易额 - 平台费", () => {
-    const input = buildInput(baseForm);
+    const input = buildInput(baseForm, TEST_FEE_RULES);
     const r = calculate(input);
     near(r.netRevenue, 92);
   });
 
   it("成本正确换算为 MYR", () => {
-    const input = buildInput(baseForm);
+    const input = buildInput(baseForm, TEST_FEE_RULES);
     const r = calculate(input);
     near(r.totalCogs, 25); // 50 CNY / 2
   });
 
   it("净利润计算正确", () => {
-    const input = buildInput(baseForm);
+    const input = buildInput(baseForm, TEST_FEE_RULES);
     const r = calculate(input);
     near(r.netProfit, 53.2);
   });
 
   it("净利率 = 净利润 / 总交易额", () => {
-    const input = buildInput(baseForm);
+    const input = buildInput(baseForm, TEST_FEE_RULES);
     const r = calculate(input);
     near(r.netMargin, 0.532);
   });
 
   it("MYR 成本不做汇率换算", () => {
     const form = { ...baseForm, costCurrency: "MYR" as const, purchasePrice: 30 };
-    const input = buildInput(form);
+    const input = buildInput(form, TEST_FEE_RULES);
     const r = calculate(input);
     // 成本 = 30+5+2+10+3 = 50 MYR
     near(r.totalCogs, 50);
   });
 
   it("退款率为0时期望利润等于净利润", () => {
-    const input = buildInput(baseForm);
+    const input = buildInput(baseForm, TEST_FEE_RULES);
     const r = calculate(input);
     near(r.expectedProfit, r.netProfit.toNumber());
   });
 
   it("退款率 > 0 时期望利润低于净利润", () => {
     const form = { ...baseForm, refundRate: 10, refundExtraCost: 5 };
-    const input = buildInput(form);
+    const input = buildInput(form, TEST_FEE_RULES);
     const r = calculate(input);
     expect(r.expectedProfit.lt(r.netProfit)).toBe(true);
   });
 
   it("亏损时给出红色风险标记", () => {
     const form = { ...baseForm, purchasePrice: 200 };
-    const input = buildInput(form);
+    const input = buildInput(form, TEST_FEE_RULES);
     const r = calculate(input);
     expect(r.netProfit.lt(0)).toBe(true);
     expect(r.risks.some((x) => x.level === "red")).toBe(true);
   });
 
   it("费用明细包含来源与公式", () => {
-    const input = buildInput(baseForm);
+    const input = buildInput(baseForm, TEST_FEE_RULES);
     const r = calculate(input);
     const comm = r.feeBreakdown.find((f) => f.feeType === "COMMISSION");
     expect(comm).toBeDefined();
@@ -222,7 +236,7 @@ describe("solver", () => {
   };
 
   it("保本价处净利润≈0（误差<=0.01）", () => {
-    const input = buildInput(form);
+    const input = buildInput(form, TEST_FEE_RULES);
     const be = solveBreakEven(input);
     expect(be).not.toBeNull();
     // 在保本价处重新计算净利润应接近 0
@@ -231,13 +245,13 @@ describe("solver", () => {
   });
 
   it("保本价低于当前售价（当前盈利时）", () => {
-    const input = buildInput(form);
+    const input = buildInput(form, TEST_FEE_RULES);
     const be = solveBreakEven(input);
     expect(be!.lt(input.originalPrice)).toBe(true);
   });
 
   it("目标净利率售价使净利率≈目标值", () => {
-    const input = buildInput(form);
+    const input = buildInput(form, TEST_FEE_RULES);
     const target = new Decimal("0.2");
     const price = solveTargetMargin(input, target);
     expect(price).not.toBeNull();
@@ -250,14 +264,14 @@ describe("solver", () => {
 
 describe("scenarios", () => {
   it("返回三种情景", () => {
-    const input = buildInput(DEFAULT_FORM);
+    const input = buildInput(DEFAULT_FORM, TEST_FEE_RULES);
     const results = calculateScenarios(input);
     expect(results).toHaveLength(3);
     expect(results.map((r) => r.label)).toEqual(["乐观", "正常", "悲观"]);
   });
 
   it("乐观情景利润 >= 悲观情景", () => {
-    const input = buildInput(DEFAULT_FORM);
+    const input = buildInput(DEFAULT_FORM, TEST_FEE_RULES);
     const results = calculateScenarios(input);
     const optimistic = results.find((r) => r.label === "乐观")!;
     const pessimistic = results.find((r) => r.label === "悲观")!;
@@ -265,7 +279,7 @@ describe("scenarios", () => {
   });
 
   it("自定义情景参数生效", () => {
-    const input = buildInput(DEFAULT_FORM);
+    const input = buildInput(DEFAULT_FORM, TEST_FEE_RULES);
     const results = calculateScenarios(input, DEFAULT_SCENARIOS);
     expect(results.every((r) => r.netProfit instanceof Decimal)).toBe(true);
   });

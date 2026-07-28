@@ -27,7 +27,12 @@ import Results from "./Results";
 
 const CATEGORIES = [
   { value: "", label: "通用 / 默认费率" },
-  { value: "Electronics", label: "Electronics（电子产品）" },
+  { value: "Electronics", label: "Electronics（电子 - 通用）" },
+  { value: "Electronics > Phones & Electronics", label: "  └ 手机/平板/相机/游戏" },
+  { value: "Electronics > Phone Accessories", label: "  └ 手机配件/通用配件" },
+  { value: "Electronics > Computers & Office", label: "  └ 电脑组件/外设/办公" },
+  { value: "Electronics > Automotive & Motorcycle", label: "  └ 汽车电子/摩托车" },
+  { value: "Electronics > Household Appliances", label: "  └ 家用电器" },
   { value: "Fashion", label: "Fashion（服饰）" },
   { value: "Home & Living", label: "Home & Living（家居）" },
   { value: "Beauty & Personal Care", label: "Beauty（美妆个护）" },
@@ -57,6 +62,7 @@ export default function MyProfit() {
   const [dirty, setDirty] = useState(false);
   const [validationErrors, setValidationErrors] = useState<ValidationError[]>([]);
   const [rules, setRules] = useState<RawFeeRule[] | null>(null);
+  const [rulesFailed, setRulesFailed] = useState(false);
   const [rateInfo, setRateInfo] = useState<{
     rate: number;
     isRealtime: boolean;
@@ -68,9 +74,14 @@ export default function MyProfit() {
     fetch("/api/my-profit/fee-rules?site=MY")
       .then((r) => r.json())
       .then((d) => {
-        if (d?.rules?.length) setRules(d.rules as RawFeeRule[]);
+        if (d?.rules?.length) {
+          setRules(d.rules as RawFeeRule[]);
+          setRulesFailed(false);
+        } else {
+          setRulesFailed(true);
+        }
       })
-      .catch(() => setRules(null));
+      .catch(() => { setRules(null); setRulesFailed(true); });
 
     fetch("/api/my-profit/exchange-rate?from=MYR&to=CNY")
       .then((r) => r.json())
@@ -89,6 +100,12 @@ export default function MyProfit() {
   };
 
   const runCalc = () => {
+    // 费率规则未加载时阻止计算
+    if (!rules || rules.length === 0) {
+      setValidationErrors([{ field: "feeRules", message: "费率规则未加载，无法进行精准计算。请刷新页面重试。" }]);
+      setComputed(null);
+      return;
+    }
     const errors = validateForm(form);
     if (errors.length > 0) {
       setValidationErrors(errors);
@@ -96,7 +113,7 @@ export default function MyProfit() {
       return;
     }
     setValidationErrors([]);
-    const input = buildInput(form, rules ?? undefined);
+    const input = buildInput(form, rules);
     const result = calculate(input);
     const scenarios = calculateScenarios(input);
     setComputed({ result, scenarios });
@@ -282,13 +299,21 @@ export default function MyProfit() {
           )}
         </Section>
 
+        {rulesFailed && (
+          <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700">
+            <p className="font-bold">费率数据加载失败</p>
+            <p className="mt-1 text-xs">无法获取平台费率规则，计算功能已禁用。请检查网络后刷新页面。</p>
+          </div>
+        )}
+
         <div className="flex gap-3">
           <button
             onClick={runCalc}
-            className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg bg-accent px-5 py-3 text-sm font-bold text-white shadow-[2px_2px_0_0_rgba(21,24,30,0.9)] transition-all hover:bg-accent/90 active:translate-y-0.5"
+            disabled={!rules || rules.length === 0}
+            className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg bg-accent px-5 py-3 text-sm font-bold text-white shadow-[2px_2px_0_0_rgba(21,24,30,0.9)] transition-all hover:bg-accent/90 active:translate-y-0.5 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Calculator size={16} />
-            {computed && dirty ? "重新计算" : "立即计算"}
+            {!rules ? "费率加载中…" : computed && dirty ? "重新计算" : "立即计算"}
           </button>
           <button
             onClick={reset}
