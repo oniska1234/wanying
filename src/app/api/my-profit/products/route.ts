@@ -195,92 +195,103 @@ export async function POST(req: Request) {
   }
 
   // === P1-001: 事务内额度检查 + 创建（防止并发竞态） ===
-  try {
-    const product = await prisma.$transaction(async (tx) => {
-      // 用户级咨询锁：序列化同一用户的并发创建请求（事务结束自动释放）
-      const lockKey = BigInt(parseInt(session.user!.id.replace(/[^0-9a-f]/gi, "").slice(0, 14), 16) % Number.MAX_SAFE_INTEGER);
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey}::bigint)`;
+  const MAX_RETRIES = 3;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const product = await prisma.$transaction(async (tx) => {
+        // 用户级咨询锁：序列化同一用户的并发创建请求（事务结束自动释放）
+        const lockKey = BigInt(parseInt(session.user!.id.replace(/[^0-9a-f]/gi, "").slice(0, 14), 16) % Number.MAX_SAFE_INTEGER);
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey}::bigint)`;
 
-      // 统计当前用户商品数（已被咨询锁保护，无竞态）
-      const currentCount = await tx.product.count({
-        where: { userId: session.user!.id },
-      });
+        // 统计当前用户商品数（已被咨询锁保护，无竞态）
+        const currentCount = await tx.product.count({
+          where: { userId: session.user!.id },
+        });
 
-      // 额度检查
-      const plan = await tx.subscription.findFirst({
-        where: { userId: session.user!.id, status: "ACTIVE" },
-        orderBy: { createdAt: "desc" },
-      });
-      const isPro = plan?.plan === "PRO" && (!plan.expiresAt || plan.expiresAt.getTime() > Date.now());
+        // 额度检查
+        const plan = await tx.subscription.findFirst({
+          where: { userId: session.user!.id, status: "ACTIVE" },
+          orderBy: { createdAt: "desc" },
+        });
+        const isPro = plan?.plan === "PRO" && (!plan.expiresAt || plan.expiresAt.getTime() > Date.now());
 
-      if (!isPro && currentCount >= FREE_LIMITS.maxProducts) {
-        throw new QuotaExceededError(currentCount);
-      }
+        if (!isPro && currentCount >= FREE_LIMITS.maxProducts) {
+          throw new QuotaExceededError(currentCount);
+        }
 
-      // 创建商品 + SKU + 计算记录
-      return tx.product.create({
-        data: {
-          userId: session.user!.id,
-          name: name.slice(0, 100),
-          url: body.url || null,
-          category: body.category || "",
-          shopType: (body.shopType as "MARKETPLACE" | "MALL") || "MARKETPLACE",
-          bxpStatus: (body.bxpStatus as "BXP" | "NON_BXP" | "UNCERTAIN") || "NON_BXP",
-          status: "PENDING",
-          tags: Array.isArray(body.tags) ? body.tags.slice(0, 10).map((t) => String(t).slice(0, 20)) : [],
-          note: body.note || null,
-          skus: {
-            create: {
-              name: body.sku!.name || null,
-              originalPrice: Number(form.originalPrice) || 0,
-              sellerDiscount: Number(form.sellerDiscount) || 0,
-              platformDiscount: Number(form.platformDiscount) || 0,
-              buyerShipping: Number(form.buyerShipping) || 0,
-              quantity: Math.max(1, Math.round(Number(form.quantity) || 1)),
-              costCurrency: String(form.costCurrency || "CNY"),
-              purchasePrice: Number(form.purchasePrice) || 0,
-              domesticShipping: Number(form.domesticShipping) || 0,
-              packagingCost: Number(form.packagingCost) || 0,
-              crossBorderLogistics: Number(form.crossBorderLogistics) || 0,
-              localFulfillment: Number(form.localFulfillment) || 0,
-              storageCost: Number(form.storageCost) || 0,
-              otherCost: Number(form.otherCost) || 0,
-              affiliateRate: (Number(form.affiliateRate) || 0) / 100,
-              affiliateFixed: Number(form.affiliateFixed) || 0,
-              adRate: (Number(form.adRate) || 0) / 100,
-              adFixed: Number(form.adFixed) || 0,
-              refundRate: (Number(form.refundRate) || 0) / 100,
-              refundRecovery: Number(form.refundRecovery) || 0,
-              refundExtraCost: Number(form.refundExtraCost) || 0,
-              exchangeRate: Number(form.exchangeRate) || 1,
-              calculations: {
-                create: {
-                  inputSnapshot: form as unknown as object,
-                  resultSnapshot: JSON.parse(JSON.stringify(serverResult, (k, v) => typeof v === "object" && v !== null && v.constructor?.name === "Decimal" ? v.toString() : v)),
-                  feeRuleVersion: serverResult.feeRuleVersions?.join(",") || null,
-                  exchangeRateValue: Number(form.exchangeRate) || 1,
-                  netProfit: serverResult.netProfit.toNumber(),
-                  netMargin: Math.max(-9.9999, Math.min(9.9999, serverResult.netMargin.toNumber())),
-                  breakEvenPrice: serverResult.breakEvenPrice?.toNumber() ?? null,
-                  maxPurchasePrice: serverResult.maxPurchasePrice?.toNumber() ?? null,
+        // 创建商品 + SKU + 计算记录
+        return tx.product.create({
+          data: {
+            userId: session.user!.id,
+            name: name.slice(0, 100),
+            url: body.url || null,
+            category: body.category || "",
+            shopType: (body.shopType as "MARKETPLACE" | "MALL") || "MARKETPLACE",
+            bxpStatus: (body.bxpStatus as "BXP" | "NON_BXP" | "UNCERTAIN") || "NON_BXP",
+            status: "PENDING",
+            tags: Array.isArray(body.tags) ? body.tags.slice(0, 10).map((t) => String(t).slice(0, 20)) : [],
+            note: body.note || null,
+            skus: {
+              create: {
+                name: body.sku!.name || null,
+                originalPrice: Number(form.originalPrice) || 0,
+                sellerDiscount: Number(form.sellerDiscount) || 0,
+                platformDiscount: Number(form.platformDiscount) || 0,
+                buyerShipping: Number(form.buyerShipping) || 0,
+                quantity: Math.max(1, Math.round(Number(form.quantity) || 1)),
+                costCurrency: String(form.costCurrency || "CNY"),
+                purchasePrice: Number(form.purchasePrice) || 0,
+                domesticShipping: Number(form.domesticShipping) || 0,
+                packagingCost: Number(form.packagingCost) || 0,
+                crossBorderLogistics: Number(form.crossBorderLogistics) || 0,
+                localFulfillment: Number(form.localFulfillment) || 0,
+                storageCost: Number(form.storageCost) || 0,
+                otherCost: Number(form.otherCost) || 0,
+                affiliateRate: (Number(form.affiliateRate) || 0) / 100,
+                affiliateFixed: Number(form.affiliateFixed) || 0,
+                adRate: (Number(form.adRate) || 0) / 100,
+                adFixed: Number(form.adFixed) || 0,
+                refundRate: (Number(form.refundRate) || 0) / 100,
+                refundRecovery: Number(form.refundRecovery) || 0,
+                refundExtraCost: Number(form.refundExtraCost) || 0,
+                exchangeRate: Number(form.exchangeRate) || 1,
+                calculations: {
+                  create: {
+                    inputSnapshot: form as unknown as object,
+                    resultSnapshot: JSON.parse(JSON.stringify(serverResult, (k, v) => typeof v === "object" && v !== null && v.constructor?.name === "Decimal" ? v.toString() : v)),
+                    feeRuleVersion: serverResult.feeRuleVersions?.join(",") || null,
+                    exchangeRateValue: Number(form.exchangeRate) || 1,
+                    netProfit: serverResult.netProfit.toNumber(),
+                    netMargin: Math.max(-9.9999, Math.min(9.9999, serverResult.netMargin.toNumber())),
+                    breakEvenPrice: serverResult.breakEvenPrice?.toNumber() ?? null,
+                    maxPurchasePrice: serverResult.maxPurchasePrice?.toNumber() ?? null,
+                  },
                 },
               },
             },
           },
-        },
-      });
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+        });
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
 
-    return NextResponse.json({ ok: true, id: product.id });
-  } catch (e) {
-    if (e instanceof QuotaExceededError) {
-      return NextResponse.json(
-        { error: `免费版最多保存 ${FREE_LIMITS.maxProducts} 个商品，升级 Pro 解锁无限选品。`, quota: { productCount: e.count, maxProducts: FREE_LIMITS.maxProducts } },
-        { status: 403 }
-      );
+      return NextResponse.json({ ok: true, id: product.id });
+    } catch (e) {
+      if (e instanceof QuotaExceededError) {
+        return NextResponse.json(
+          { error: `免费版最多保存 ${FREE_LIMITS.maxProducts} 个商品，升级 Pro 解锁无限选品。`, quota: { productCount: e.count, maxProducts: FREE_LIMITS.maxProducts } },
+          { status: 403 }
+        );
+      }
+      // 瞬态死锁/冲突：重试
+      const msg = e instanceof Error ? e.message : "";
+      const isTransient = msg.includes("deadlock") || msg.includes("write conflict") || msg.includes("40P01") || msg.includes("40001");
+      if (isTransient && attempt < MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, 50 * attempt));
+        continue;
+      }
+      return NextResponse.json({ error: "保存失败，请重试", code: "INTERNAL" }, { status: 500 });
     }
-    return NextResponse.json({ error: "保存失败，请重试", code: "INTERNAL" }, { status: 500 });
   }
+  return NextResponse.json({ error: "保存失败，请重试", code: "INTERNAL" }, { status: 500 });
 }
 
 class QuotaExceededError extends Error {
