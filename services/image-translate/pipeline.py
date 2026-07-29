@@ -101,7 +101,15 @@ class ImagePipeline:
             # Trim white borders
             edited = trim_near_white_border(edited)
 
-            # First pass: detect and translate Chinese text
+            # Try Qwen-VL vision analysis first for layout-aware translation
+            vision_data = self.translator.vision_analyze_image(source_path)
+            vision_repaired = 0
+            if vision_data:
+                edited, vision_repaired = self.detector.apply_vision_replacements(
+                    edited, vision_data
+                )
+
+            # Fallback: RapidOCR pass for any remaining Chinese text
             source_residual = self.detector.repair_and_verify(
                 edited, allow_repair=True, translator=self.translator,
             )
@@ -119,7 +127,7 @@ class ImagePipeline:
             final_brand = self.detector.remove_brands_and_verify(final_residual.image)
             final = final_brand.image
 
-            repaired_count = len(source_residual.repaired) + len(final_residual.repaired)
+            repaired_count = vision_repaired + len(source_residual.repaired) + len(final_residual.repaired)
             removed_brand_count = len(source_brand.repaired) + len(final_brand.repaired)
 
             # Save output

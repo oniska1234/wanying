@@ -530,6 +530,159 @@ class ResidualChineseDetector:
                     min_size=8, pad=4, stroke_width=stroke_w, stroke_fill=stroke_fill,
                 )
 
+    def apply_vision_replacements(self, image: Image.Image, vision_data: list) -> tuple:
+        """Apply translations from Qwen-VL vision analysis with proper layout.
+
+        Args:
+            image: PIL Image to modify in-place
+            vision_data: list of dicts from Qwen-VL with box, text, translation,
+                        orientation, color, font_size
+
+        Returns:
+            (modified_image, count_of_replacements)
+        """
+        edited = image.copy().convert("RGB")
+        count = 0
+
+        # Build pseudo-hits for inpainting
+        hits_to_inpaint = []
+        render_tasks = []
+
+        for item in vision_data:
+            try:
+                box = item.get("box", [])
+                if len(box) != 4:
+                    continue
+                x1, y1, x2, y2 = [int(v) for v in box]
+                # Clamp to image bounds
+                w, h = edited.size
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                translation = item.get("translation", "")
+                if not translation:
+                    # Brand/logo - just inpaint to remove
+                    hits_to_inpaint.append(ChineseHit(
+                        text=item.get("text", ""),
+                        confidence=0.9,
+                        box=(x1, y1, x2, y2),
+                        polygon=((x1, y1), (x2, y1), (x2, y2), (x1, y2)),
+                    ))
+                    continue
+
+                orientation = item.get("orientation", "horizontal")
+                color = item.get("color", [30, 30, 30])
+                if isinstance(color, list) and len(color) == 3:
+                    fg = tuple(int(c) for c in color)
+                else:
+                    fg = (30, 30, 30)
+                font_size = item.get("font_size", 20)
+                if not isinstance(font_size, (int, float)) or font_size < 8:
+                    font_size = 20
+
+                hits_to_inpaint.append(ChineseHit(
+                    text=item.get("text", ""),
+                    confidence=0.9,
+                    box=(x1, y1, x2, y2),
+                    polygon=((x1, y1), (x2, y1), (x2, y2), (x1, y2)),
+                ))
+                render_tasks.append({
+                    "box": (x1, y1, x2, y2),
+                    "translation": translation,
+                    "orientation": orientation,
+                    "color": fg,
+                    "font_size": int(font_size),
+                })
+            except (ValueError, TypeError, KeyError) as e:
+                LOGGER.warning("Vision item parse error: %s", e)
+                continue
+
+        # Inpaint all regions
+        if hits_to_inpaint:
+            self._inpaint_hits(edited, hits_to_inpaint)
+
+        # Render translations with proper layout
+        draw = ImageDraw.Draw(edited)
+        for task in render_tasks:
+            box = task["box"]
+            translation = task["translation"]
+            orientation = task["orientation"]
+            fg = task["color"]
+            font_size = task["font_size"]
+
+            x1, y1, x2, y2 = box
+            box_w = x2 - x1
+            box_h = y2 - y1
+
+            # Cap font size to box dimensions
+            if orientation == "vertical":
+                # For vertical: font_size should fit in column width
+                max_fs = min(font_size, box_w - 4, box_h // 2)
+            else:
+                max_fs = min(font_size, box_h - 4)
+            max_fs = max(10, max_fs)
+
+            try:
+                fnt = ImageFont.truetype(str(FONT_BOLD), size=max_fs)
+            except OSError:
+                fnt = ImageFont.load_default()
+
+            if orientation == "vertical":
+                # Render words stacked vertically, one per line
+                words = translation.split()
+                if not words:
+                    continue
+                # Check if all words fit at this font size
+                # If not, reduce font size
+                while max_fs > 10:
+                    try:
+                        fnt = ImageFont.truetype(str(FONT_BOLD), size=max_fs)
+                    except OSError:
+                        break
+                    max_ww = max(draw.textbbox((0, 0), w, font=fnt)[2] - draw.textbbox((0, 0), w, font=fnt)[0] for w in words)
+                    spacing = max(3, int(max_fs * 0.25))
+                    total_h = sum(draw.textbbox((0, 0), w, font=fnt)[3] - draw.textbbox((0, 0), w, font=fnt)[1] for w in words) + spacing * (len(words) - 1)
+                    if max_ww <= box_w and total_h <= box_h:
+                        break
+                    max_fs -= 2
+
+                try:
+                    fnt = ImageFont.truetype(str(FONT_BOLD), size=max_fs)
+                except OSError:
+                    fnt = ImageFont.load_default()
+
+                # Calculate positions
+                line_info = []
+                for word in words:
+                    wbbox = draw.textbbox((0, 0), word, font=fnt)
+                    ww = wbbox[2] - wbbox[0]
+                    wh = wbbox[3] - wbbox[1]
+                    line_info.append((word, ww, wh))
+                spacing = max(3, int(max_fs * 0.25))
+                total_h = sum(h for _, _, h in line_info) + spacing * (len(line_info) - 1)
+
+                # Vertically center
+                cy = y1 + (box_h - total_h) // 2
+                cx = x1 + box_w // 2
+
+                for word, ww, wh in line_info:
+                    wx = cx - ww // 2
+                    draw.text((wx, cy), word, font=fnt, fill=fg)
+                    cy += wh + spacing
+            else:
+                # Horizontal: use draw_text_box
+                draw_text_box(
+                    edited, box, translation, fill=fg,
+                    max_size=max_fs, min_size=8, pad=2,
+                )
+
+            count += 1
+
+        LOGGER.info("Vision replacements applied: %d regions", count)
+        return edited, count
+
     @staticmethod
     def _sample_text_color(image: Image.Image, box: tuple[int, int, int, int]) -> tuple[int, int, int] | None:
         """Sample the dominant text color from within the bounding box."""

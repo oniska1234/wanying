@@ -1,6 +1,7 @@
 """Malay translator with Qwen LLM (primary) + Google + offline fallback."""
 from __future__ import annotations
 
+import base64
 import gc
 import json
 import logging
@@ -387,6 +388,99 @@ class MalayTranslator:
                             self.cache[t] = candidate
                             self.qwen_count += 1
         return results
+
+
+    def vision_analyze_image(self, image_path: Path) -> list | None:
+        """Send image to Qwen-VL for layout-aware text analysis and translation.
+
+        Returns list of dicts with keys:
+          - box: [x1, y1, x2, y2] in pixels
+          - text: original Chinese text
+          - translation: Malay translation
+          - orientation: "vertical" or "horizontal"
+          - color: [r, g, b] text color
+          - font_size: approximate font size in pixels
+        Returns None if vision analysis fails.
+        """
+        if self.qwen_disabled or not QWEN_API_KEY:
+            return None
+        try:
+            img_data = image_path.read_bytes()
+            b64 = base64.b64encode(img_data).decode("ascii")
+            suffix = image_path.suffix.lower()
+            if suffix in (".jpg", ".jpeg", ".jfif", ".jpe"):
+                mime = "image/jpeg"
+            elif suffix == ".png":
+                mime = "image/png"
+            elif suffix == ".webp":
+                mime = "image/webp"
+            else:
+                mime = "image/jpeg"
+
+            prompt = (
+                "You are an expert image text analyzer for e-commerce product images.\n"
+                "Analyze this image and identify ALL Chinese text regions.\n\n"
+                "For each text region, provide:\n"
+                '1. "box": [x1, y1, x2, y2] bounding box in PIXEL coordinates\n'
+                '2. "text": the original Chinese text\n'
+                '3. "translation": natural Malay (Bahasa Melayu) translation for Malaysian e-commerce\n'
+                '4. "orientation": "vertical" if text reads top-to-bottom, "horizontal" if left-to-right\n'
+                '5. "color": [R, G, B] the text color (0-255 per channel)\n'
+                '6. "font_size": approximate character height in pixels\n\n'
+                "IMPORTANT RULES:\n"
+                "- For vertical text columns, each column is a SEPARATE entry\n"
+                "- Coordinates must be in actual pixel values of the image\n"
+                "- Translation must be natural Malaysian Malay, not literal word-by-word\n"
+                '- If text is a brand name or logo, set translation to empty string ""\n'
+                "- Return ONLY valid JSON array, no markdown, no explanation\n\n"
+                "Example output:\n"
+                '[{"box":[50,100,110,400],"text":"\u79c0\u51fa\u597d\u8eab\u6750","translation":"TONJOLKAN FIGURA MENAWAN","orientation":"vertical","color":[180,180,180],"font_size":55}]\n'
+            )
+
+            payload = json.dumps({
+                "model": "qwen-vl-max",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ],
+                "temperature": 0.1,
+                "max_tokens": 4000,
+            }, ensure_ascii=False).encode("utf-8")
+
+            request = urllib.request.Request(
+                QWEN_API_URL, data=payload,
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {QWEN_API_KEY}"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=90) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+
+            choices = result.get("choices", [])
+            if not choices:
+                return None
+            raw = choices[0].get("message", {}).get("content", "")
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+            start = raw.find("[")
+            end = raw.rfind("]")
+            if start == -1 or end == -1:
+                LOGGER.warning("Vision analysis: no JSON array in response")
+                return None
+            parsed = json.loads(raw[start:end+1])
+            if not isinstance(parsed, list):
+                return None
+            LOGGER.info("Vision analysis found %d text regions", len(parsed))
+            return parsed
+        except Exception as exc:
+            LOGGER.warning("Vision analysis failed: %s", exc)
+            return None
 
     def _translate_qwen_batch(self, numbered_text: str) -> dict[str, str] | None:
         """Send batch to Qwen and parse JSON response."""
