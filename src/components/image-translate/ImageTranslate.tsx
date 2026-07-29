@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
-import { Upload, Download, RefreshCw, X, XCircle, Loader2, ImageIcon } from "lucide-react";
+import { Upload, Download, RefreshCw, X, XCircle, Loader2, ImageIcon, ZoomIn, ChevronLeft, ChevronRight } from "lucide-react";
 
 interface TaskItem {
   id: string;
@@ -34,6 +34,7 @@ export default function ImageTranslate() {
   const [history, setHistory] = useState<TaskInfo[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [error, setError] = useState("");
+  const [previewIndex, setPreviewIndex] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -47,21 +48,17 @@ export default function ImageTranslate() {
     } catch { /* ignore */ }
   }, []);
 
-  useEffect(() => {
-    if (authStatus === "authenticated") loadHistory();
-  }, [authStatus, loadHistory]);
-
-  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
-
   const pollTask = useCallback(async (taskId: string) => {
     try {
       const res = await fetch(`/api/image-translate/task/${taskId}`);
-      if (!res.ok) return;
-      const data: TaskDetail = await res.json();
-      setCurrentTask(data);
-      if (data.status === "done" || data.status === "failed") {
-        if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-        loadHistory();
+      if (res.ok) {
+        const data: TaskDetail = await res.json();
+        setCurrentTask(data);
+        if (data.status !== "processing" && pollRef.current) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+          loadHistory();
+        }
       }
     } catch { /* ignore */ }
   }, [loadHistory]);
@@ -71,6 +68,11 @@ export default function ImageTranslate() {
     pollTask(taskId);
     pollRef.current = setInterval(() => pollTask(taskId), 3000);
   }, [pollTask]);
+
+  useEffect(() => {
+    loadHistory();
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, [loadHistory]);
 
   const handleFiles = (newFiles: FileList | File[]) => {
     const arr = Array.from(newFiles).filter((f) =>
@@ -122,6 +124,9 @@ export default function ImageTranslate() {
   const progress = currentTask && currentTask.total_count > 0
     ? Math.round(((currentTask.done_count + currentTask.failed_count) / currentTask.total_count) * 100)
     : 0;
+
+  // Previewable items (have both source and output)
+  const previewItems = currentTask?.items?.filter((it) => it.source_url && it.output_url) || [];
 
   if (authStatus === "loading") return <div className="py-20 text-center text-muted">加载中...</div>;
   if (authStatus !== "authenticated") return <div className="py-20 text-center text-muted">请先登录后使用此工具</div>;
@@ -179,14 +184,25 @@ export default function ImageTranslate() {
 
           {currentTask.items && currentTask.items.length > 0 && (
             <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              {currentTask.items.map((item) => (
+              {currentTask.items.map((item, idx) => (
                 <div key={item.id} className="rounded-lg border border-line bg-surface p-3">
                   <div className="flex items-center gap-2">
                     {item.source_url && <img src={item.source_url} alt="原图" className="h-16 w-16 rounded object-contain border border-line" />}
                     <span className="text-muted">→</span>
                     {item.output_url ? <img src={item.output_url} alt="译图" className="h-16 w-16 rounded object-contain border border-line" /> : item.status === "failed" ? <XCircle className="text-red-400" size={24} /> : <Loader2 className="animate-spin text-muted" size={24} />}
                   </div>
-                  <p className="mt-2 truncate text-xs text-muted">{item.file_name}</p>
+                  <div className="mt-2 flex items-center justify-between">
+                    <p className="truncate text-xs text-muted">{item.file_name}</p>
+                    {item.source_url && item.output_url && (
+                      <button
+                        onClick={() => setPreviewIndex(previewItems.findIndex((p) => p.id === item.id))}
+                        className="ml-2 inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs text-accent hover:bg-accent/10"
+                        title="对比预览"
+                      >
+                        <ZoomIn size={12} /> 对比
+                      </button>
+                    )}
+                  </div>
                 </div>
               ))}
             </div>
@@ -231,6 +247,132 @@ export default function ImageTranslate() {
           </div>
         )}
       </section>
+
+      {/* Comparison Preview Modal */}
+      {previewIndex !== null && previewItems[previewIndex] && (
+        <CompareModal
+          items={previewItems}
+          index={previewIndex}
+          onClose={() => setPreviewIndex(null)}
+          onNavigate={(i) => setPreviewIndex(i)}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ─── Compare Modal with Slider ─── */
+function CompareModal({ items, index, onClose, onNavigate }: {
+  items: TaskItem[];
+  index: number;
+  onClose: () => void;
+  onNavigate: (i: number) => void;
+}) {
+  const item = items[index];
+  const [sliderPos, setSliderPos] = useState(50);
+  const [mode, setMode] = useState<"slider" | "side">("slider");
+  const containerRef = useRef<HTMLDivElement>(null);
+  const dragging = useRef(false);
+
+  // Reset slider when switching images
+  useEffect(() => { setSliderPos(50); }, [index]);
+
+  // Keyboard navigation
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+      if (e.key === "ArrowLeft" && index > 0) onNavigate(index - 1);
+      if (e.key === "ArrowRight" && index < items.length - 1) onNavigate(index + 1);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [index, items.length, onClose, onNavigate]);
+
+  const handleMove = (clientX: number) => {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
+    setSliderPos((x / rect.width) * 100);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col bg-black/80 backdrop-blur-sm" onClick={onClose}>
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-3">
+          <span className="text-sm font-medium text-white">{item.file_name}</span>
+          <span className="text-xs text-white/50">{index + 1} / {items.length}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          {/* Mode toggle */}
+          <button
+            onClick={() => setMode(mode === "slider" ? "side" : "slider")}
+            className="rounded-md border border-white/20 px-2.5 py-1 text-xs text-white/80 hover:bg-white/10"
+          >
+            {mode === "slider" ? "并排对比" : "滑动对比"}
+          </button>
+          <button onClick={onClose} className="rounded-md p-1 text-white/80 hover:bg-white/10"><X size={20} /></button>
+        </div>
+      </div>
+
+      {/* Body */}
+      <div className="flex flex-1 items-center justify-center overflow-hidden px-4 pb-4" onClick={(e) => e.stopPropagation()}>
+        {/* Nav arrows */}
+        {index > 0 && (
+          <button onClick={() => onNavigate(index - 1)} className="absolute left-3 z-10 rounded-full bg-white/10 p-2 text-white hover:bg-white/20">
+            <ChevronLeft size={24} />
+          </button>
+        )}
+        {index < items.length - 1 && (
+          <button onClick={() => onNavigate(index + 1)} className="absolute right-3 z-10 rounded-full bg-white/10 p-2 text-white hover:bg-white/20">
+            <ChevronRight size={24} />
+          </button>
+        )}
+
+        {mode === "slider" ? (
+          /* Slider comparison mode */
+          <div
+            ref={containerRef}
+            className="relative max-h-[75vh] max-w-[90vw] cursor-col-resize select-none overflow-hidden rounded-lg"
+            onMouseDown={(e) => { dragging.current = true; handleMove(e.clientX); }}
+            onMouseMove={(e) => { if (dragging.current) handleMove(e.clientX); }}
+            onMouseUp={() => { dragging.current = false; }}
+            onMouseLeave={() => { dragging.current = false; }}
+            onTouchStart={(e) => { dragging.current = true; handleMove(e.touches[0].clientX); }}
+            onTouchMove={(e) => { if (dragging.current) handleMove(e.touches[0].clientX); }}
+            onTouchEnd={() => { dragging.current = false; }}
+          >
+            {/* Output (translated) - full background */}
+            <img src={item.output_url!} alt="翻译后" className="block max-h-[75vh] w-auto max-w-full" draggable={false} />
+            {/* Source (original) - clipped overlay */}
+            <div className="absolute inset-0 overflow-hidden" style={{ width: `${sliderPos}%` }}>
+              <img src={item.source_url!} alt="原图" className="block h-full max-h-[75vh] w-auto max-w-none object-cover" draggable={false} style={{ minWidth: containerRef.current?.offsetWidth || "100%" }} />
+            </div>
+            {/* Slider line */}
+            <div className="absolute inset-y-0 z-10" style={{ left: `${sliderPos}%` }}>
+              <div className="absolute inset-y-0 -ml-px w-0.5 bg-white shadow-lg" />
+              <div className="absolute top-1/2 -ml-4 -mt-4 flex h-8 w-8 items-center justify-center rounded-full border-2 border-white bg-white/90 shadow-lg">
+                <span className="text-[10px] font-bold text-gray-700">⇔</span>
+              </div>
+            </div>
+            {/* Labels */}
+            <span className="absolute left-2 top-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white">原图</span>
+            <span className="absolute right-2 top-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white">译文</span>
+          </div>
+        ) : (
+          /* Side-by-side comparison mode */
+          <div className="flex max-h-[75vh] max-w-[90vw] gap-4 overflow-auto">
+            <div className="flex flex-col items-center">
+              <span className="mb-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white">原图</span>
+              <img src={item.source_url!} alt="原图" className="max-h-[65vh] w-auto rounded-lg border border-white/20 object-contain" />
+            </div>
+            <div className="flex flex-col items-center">
+              <span className="mb-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white">翻译后</span>
+              <img src={item.output_url!} alt="翻译后" className="max-h-[65vh] w-auto rounded-lg border border-white/20 object-contain" />
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
