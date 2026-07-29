@@ -33,6 +33,34 @@ class OSSClient:
     def available(self) -> bool:
         return self._bucket is not None
 
+    def ensure_lifecycle(self) -> bool:
+        """Ensure OSS lifecycle rule exists for image-translate/ prefix (90-day expiry)."""
+        if not self._bucket:
+            return False
+        try:
+            from oss2.models import LifecycleRule, LifecycleExpiration, BucketLifecycle
+            rule_id = "image-translate-expire-90d"
+            try:
+                existing = self._bucket.get_bucket_lifecycle()
+                for r in existing.rules:
+                    if r.id == rule_id and r.status == "Enabled":
+                        return True  # Already exists
+                rules = list(existing.rules)
+            except oss2.exceptions.NoSuchLifecycle:
+                rules = []
+            rules.append(LifecycleRule(
+                rule_id,
+                "image-translate/",
+                status=LifecycleRule.ENABLED,
+                expiration=LifecycleExpiration(days=90),
+            ))
+            self._bucket.put_bucket_lifecycle(BucketLifecycle(rules))
+            LOGGER.info("OSS lifecycle rule ensured: image-translate/ expires in 90 days")
+            return True
+        except Exception as e:
+            LOGGER.warning("Failed to ensure OSS lifecycle: %s", e)
+            return False
+
     def upload_file(self, local_path: Path, object_key: str) -> str:
         """Upload a local file to OSS. Returns the object key."""
         if not self._bucket:

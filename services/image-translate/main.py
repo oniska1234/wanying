@@ -144,6 +144,9 @@ async def lifespan(app: FastAPI):
         LOGGER.info("Recovered %d stale tasks (marked as failed)", recovered)
     pipeline = ImagePipeline()
     oss = OSSClient()
+    # Self-heal: ensure OSS lifecycle rule exists
+    if oss.available:
+        oss.ensure_lifecycle()
     LOGGER.info("Service ready.")
     yield
     LOGGER.info("Shutting down.")

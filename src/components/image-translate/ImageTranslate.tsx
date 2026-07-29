@@ -83,6 +83,7 @@ export default function ImageTranslate() {
       if (f.size > MAX_FILE) { setError(`文件 ${f.name} 超过 10MB 限制`); return false; }
       return true;
     });
+    if (valid.length === 0) return;
     setFiles((prev) => {
       const combined = [...prev, ...valid].slice(0, 50);
       const totalSize = combined.reduce((s, f) => s + f.size, 0);
@@ -90,7 +91,6 @@ export default function ImageTranslate() {
       setError("");
       return combined;
     });
-    setError("");
   };
 
   const submitTask = async () => {
