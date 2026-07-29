@@ -1,4 +1,8 @@
-"""OCR-based residual Chinese text detection and replacement."""
+"""OCR-based residual Chinese text detection and replacement.
+
+Layout-aware rendering: extracts angle, size, color, weight from original text
+polygon and pixel data, then replicates the exact same style for translations.
+"""
 from __future__ import annotations
 
 import logging
@@ -6,6 +10,7 @@ import math
 import re
 from collections import Counter
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import cv2
@@ -20,7 +25,7 @@ LOGGER = logging.getLogger("image_translate.ocr")
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 TRANSLATION_BOX_SCALE = 1.18
-TRANSLATION_FONT_MAX_SIZE = 72
+TRANSLATION_FONT_MAX_SIZE = 80
 
 
 @dataclass(frozen=True)
@@ -29,6 +34,17 @@ class ChineseHit:
     confidence: float
     box: tuple[int, int, int, int]
     polygon: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class TextLayout:
+    """Extracted layout properties from original text region."""
+    angle: float          # rotation angle in degrees (0 = horizontal)
+    font_size: int        # character height in pixels
+    color: tuple[int, int, int]  # RGB text color
+    is_bold: bool         # whether text appears bold
+    box: tuple[int, int, int, int]  # bounding box
+    line_count: int       # number of text lines detected
 
 
 @dataclass(frozen=True)
@@ -47,7 +63,7 @@ def normalize_text(text: str) -> str:
     return re.sub(r"[\s,，、。.!！?？:：;；·()（）\[\]【】_-]", "", text)
 
 
-# Common phrase translations for product images
+# Common phrase translations
 PHRASE_TRANSLATIONS = {
     "产品信息": "MAKLUMAT PRODUK",
     "承重力强": "DAYA TAHAN BEBAN KUAT",
@@ -102,7 +118,7 @@ PHRASE_TRANSLATIONS = {
     "与众不同": "REKA BENTUK UNIK",
     "蛋黄鸭家族化设计": "REKA BENTUK ITIK KUNING COMEL",
     "秀出好身材": "TONJOLKAN FIGURA MENAWAN",
-    "拉长身材比例": "PANJANGKAN PROPORSI BADAN",
+    "拉长身材比例": "MEMANJANGKAN PERKADARAN TUBUH",
     "修身显瘦": "LANGSING & ANGGUN",
     "高腰收腹": "PINGGANG TINGGI RATAKAN PERUT",
     "提臀塑形": "ANGKAT PUNGGUNG BENTUK BADAN",
@@ -117,62 +133,326 @@ NORMALIZED_TRANSLATIONS = {
 }
 
 
-def _analyze_vertical_layout(box: tuple[int, int, int, int], text: str) -> dict | None:
-    """Analyze if text is vertical layout. Returns layout info or None.
-    
-    Returns dict with:
-      - columns: number of vertical columns
-      - chars_per_col: chars in each column
-      - char_size: estimated pixel size of each character
-      - is_vertical: True
+# ═══════════════════════════════════════════════════════════════════════
+# LAYOUT EXTRACTION - Analyze original text to get all visual properties
+# ═══════════════════════════════════════════════════════════════════════
+
+def extract_layout(image: Image.Image, hit: ChineseHit) -> TextLayout:
+    """Extract complete layout properties from original text region.
+
+    Uses polygon geometry for angle/size, pixel analysis for color/weight.
+    """
+    polygon = hit.polygon
+    box = hit.box
+
+    # 1. ANGLE: computed from polygon top edge vector
+    # polygon points are typically: top-left, top-right, bottom-right, bottom-left
+    if len(polygon) >= 2:
+        dx = polygon[1][0] - polygon[0][0]
+        dy = polygon[1][1] - polygon[0][1]
+        angle = math.degrees(math.atan2(dy, dx))
+    else:
+        angle = 0.0
+
+    # Normalize angle: if text is vertical (angle ~90 or ~-90), keep it
+    # If angle is close to 0 or 180, it's horizontal
+    # For vertical Chinese text, the polygon top edge goes downward
+    # so angle will be ~90 or ~-90
+
+    # 2. FONT SIZE: from polygon height (perpendicular to text direction)
+    # For horizontal text: height = polygon[3][1] - polygon[0][1]
+    # For vertical text: width = polygon[1][0] - polygon[0][0]
+    # General: use the shorter dimension of the polygon as char height
+    if len(polygon) >= 4:
+        # Width along text direction (top edge length)
+        top_len = math.hypot(polygon[1][0] - polygon[0][0], polygon[1][1] - polygon[0][1])
+        # Height perpendicular to text (left edge length)
+        left_len = math.hypot(polygon[3][0] - polygon[0][0], polygon[3][1] - polygon[0][1])
+    else:
+        top_len = box[2] - box[0]
+        left_len = box[3] - box[1]
+
+    # Determine if vertical: if the text direction is more vertical than horizontal
+    abs_angle = abs(angle) % 180
+    is_vertical = abs_angle > 45  # text reads top-to-bottom
+
+    if is_vertical:
+        # For vertical text: each character's height ≈ top_len / num_chars
+        # and character width ≈ left_len
+        cjk_count = max(1, len(CJK_RE.findall(hit.text)))
+        # Check if multiple columns: if left_len > 2 * char_width_estimate
+        char_h_from_top = top_len / cjk_count if cjk_count > 0 else left_len
+        # The font size for vertical text = the column width (left_len)
+        # because that's how big each character is rendered
+        font_size = int(left_len * 0.9)
+    else:
+        # Horizontal text: font_size ≈ line height
+        font_size = int(left_len * 0.85)
+
+    font_size = max(10, min(TRANSLATION_FONT_MAX_SIZE, font_size))
+
+    # 3. COLOR: sample text pixels from the region
+    color = _sample_text_color_from_image(image, box)
+    if color is None:
+        color = (30, 30, 30)  # default dark
+
+    # 4. BOLDNESS: analyze stroke width in the text region
+    is_bold = _detect_boldness(image, box)
+
+    # 5. LINE COUNT: estimate from polygon and text
+    if is_vertical:
+        # For vertical text, check if multiple columns
+        cjk_count = max(1, len(CJK_RE.findall(hit.text)))
+        est_char_size = font_size
+        num_cols = max(1, round(left_len / est_char_size)) if est_char_size > 0 else 1
+        line_count = num_cols
+    else:
+        line_count = 1
+
+    return TextLayout(
+        angle=angle,
+        font_size=font_size,
+        color=color,
+        is_bold=is_bold,
+        box=box,
+        line_count=line_count,
+    )
+
+
+def _sample_text_color_from_image(image: Image.Image, box: tuple[int, int, int, int]) -> Optional[tuple[int, int, int]]:
+    """Sample the dominant text color from within the bounding box."""
+    x1, y1, x2, y2 = box
+    w, h = image.size
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    region = np.asarray(image.crop((x1, y1, x2, y2)).convert("RGB"))
+    if region.size == 0:
+        return None
+    flat = region.reshape(-1, 3)
+    luminances = 0.299 * flat[:, 0] + 0.587 * flat[:, 1] + 0.114 * flat[:, 2]
+    median_lum = float(np.median(luminances))
+    if median_lum >= 128:
+        mask = luminances < median_lum * 0.6
+    else:
+        mask = luminances > median_lum * 1.5
+    text_pixels = flat[mask]
+    if len(text_pixels) < 3:
+        return None
+    avg = text_pixels.mean(axis=0).astype(int)
+    return (int(avg[0]), int(avg[1]), int(avg[2]))
+
+
+def _detect_boldness(image: Image.Image, box: tuple[int, int, int, int]) -> bool:
+    """Detect if text is bold by analyzing stroke width ratio."""
+    x1, y1, x2, y2 = box
+    w, h = image.size
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 - x1 < 10 or y2 - y1 < 10:
+        return False
+    region = np.asarray(image.crop((x1, y1, x2, y2)).convert("L"))
+    # Binarize
+    _, binary = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Distance transform to estimate stroke width
+    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 3)
+    # Mean stroke radius of text pixels
+    text_mask = binary > 0
+    if text_mask.sum() < 10:
+        return False
+    mean_radius = float(dist[text_mask].mean())
+    # Character height estimate
+    char_h = y2 - y1
+    # Bold if stroke radius > 12% of character height
+    return mean_radius > char_h * 0.12
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# LAYOUT-AWARE RENDERING - Render text matching extracted layout
+# ═══════════════════════════════════════════════════════════════════════
+
+def render_text_with_layout(
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+    text: str,
+    layout: TextLayout,
+) -> None:
+    """Render translated text matching the original layout properties.
+
+    Handles any angle (horizontal, vertical, diagonal) by:
+    1. Rendering text horizontally on a transparent canvas
+    2. Rotating to match original angle
+    3. Compositing onto the image at the correct position
+    """
+    if not text:
+        return
+
+    x1, y1, x2, y2 = box
+    box_w = x2 - x1
+    box_h = y2 - y1
+
+    angle = layout.angle
+    font_size = layout.font_size
+    color = layout.color
+    is_bold = layout.is_bold
+
+    # Choose font
+    font_path = str(FONT_BOLD) if is_bold else str(FONT_REG)
+    try:
+        fnt = ImageFont.truetype(font_path, size=font_size)
+    except OSError:
+        try:
+            fnt = ImageFont.truetype(str(FONT_BOLD), size=font_size)
+        except OSError:
+            fnt = ImageFont.load_default()
+
+    # Determine if we need rotation
+    abs_angle = abs(angle) % 180
+    needs_rotation = abs_angle > 5 and abs(abs_angle - 180) > 5
+
+    if not needs_rotation:
+        # Horizontal text: render directly with auto-fit
+        _render_horizontal(image, box, text, fnt, color, font_size)
+    else:
+        # Rotated text: render horizontal then rotate
+        _render_rotated(image, box, text, fnt, color, angle, font_size)
+
+
+def _render_horizontal(
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+    text: str,
+    fnt: ImageFont.ImageFont,
+    color: tuple[int, int, int],
+    initial_size: int,
+) -> None:
+    """Render horizontal text with auto-fit font size."""
+    x1, y1, x2, y2 = box
+    box_w = x2 - x1
+    box_h = y2 - y1
+    draw = ImageDraw.Draw(image)
+
+    # Auto-fit: reduce font size until text fits
+    size = initial_size
+    while size > 8:
+        try:
+            fnt = ImageFont.truetype(str(FONT_BOLD), size=size)
+        except OSError:
+            break
+        bbox = draw.multiline_textbbox((0, 0), text, font=fnt, spacing=2)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        if tw <= box_w - 4 and th <= box_h - 4:
+            break
+        size -= 2
+
+    try:
+        fnt = ImageFont.truetype(str(FONT_BOLD), size=size)
+    except OSError:
+        fnt = ImageFont.load_default()
+
+    bbox = draw.multiline_textbbox((0, 0), text, font=fnt, spacing=2)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    # Center in box
+    tx = x1 + (box_w - tw) // 2
+    ty = y1 + (box_h - th) // 2
+
+    draw.multiline_text((tx, ty), text, font=fnt, fill=color, spacing=2, align="center")
+
+
+def _render_rotated(
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+    text: str,
+    fnt: ImageFont.ImageFont,
+    color: tuple[int, int, int],
+    angle: float,
+    initial_size: int,
+) -> None:
+    """Render text at an angle by drawing on transparent canvas and rotating.
+
+    The text is first rendered horizontally, then rotated to match the
+    original text angle, then composited onto the image centered in the box.
     """
     x1, y1, x2, y2 = box
-    w = x2 - x1
-    h = y2 - y1
-    if w <= 0 or h <= 0:
-        return None
+    box_w = x2 - x1
+    box_h = y2 - y1
 
-    cjk_chars = CJK_RE.findall(text)
-    cjk_count = len(cjk_chars)
-    if cjk_count < 2:
-        return None
+    # For rotated text, the available space after rotation:
+    # If angle ~90 (vertical): horizontal text width must fit in box_h,
+    #                          horizontal text height must fit in box_w
+    # General formula using rotation matrix bounds:
+    rad = math.radians(abs(angle))
+    cos_a = abs(math.cos(rad))
+    sin_a = abs(math.sin(rad))
+    # Available width for horizontal text = box_w * cos + box_h * sin (approx)
+    # Available height for horizontal text = box_w * sin + box_h * cos (approx)
+    # But simpler: for ~90 deg, swap w and h
+    abs_angle = abs(angle) % 180
+    if abs_angle > 45:
+        # Mostly vertical: text length fits in box_h, text height fits in box_w
+        avail_w = box_h
+        avail_h = box_w
+    else:
+        avail_w = box_w
+        avail_h = box_h
 
-    # Estimate character size: in vertical Chinese text, each char is roughly square
-    # If text is vertical with N columns of M chars each:
-    #   char_size ≈ h / M  and  w ≈ N * char_size
-    # So: M = h / char_size, N = w / char_size
-    # And: cjk_count = N * M = (w * h) / char_size^2
-    # Therefore: char_size = sqrt(w * h / cjk_count)
-    char_size = math.sqrt(w * h / cjk_count)
+    # Auto-fit font size for the rotated case
+    draw_temp = ImageDraw.Draw(image)
+    size = initial_size
+    while size > 8:
+        try:
+            fnt = ImageFont.truetype(str(FONT_BOLD), size=size)
+        except OSError:
+            break
+        bbox = draw_temp.textbbox((0, 0), text, font=fnt)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        if tw <= avail_w - 4 and th <= avail_h - 4:
+            break
+        size -= 2
 
-    # Number of columns = w / char_size (rounded)
-    num_cols = max(1, round(w / char_size))
-    chars_per_col = max(1, round(h / char_size))
+    try:
+        fnt = ImageFont.truetype(str(FONT_BOLD), size=size)
+    except OSError:
+        fnt = ImageFont.load_default()
 
-    # Validate: char_size should be reasonable (at least 15px)
-    if char_size < 15:
-        return None
+    # Render text on transparent canvas
+    bbox = draw_temp.textbbox((0, 0), text, font=fnt)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    padding = 4
+    txt_img = Image.new("RGBA", (tw + padding * 2, th + padding * 2), (0, 0, 0, 0))
+    txt_draw = ImageDraw.Draw(txt_img)
+    txt_draw.text(
+        (padding - bbox[0], padding - bbox[1]),
+        text, font=fnt, fill=color + (255,),
+    )
 
-    # Check if this looks like vertical layout:
-    # - Multiple chars stacked (chars_per_col >= 2), OR
-    # - Box is taller than wide (single column vertical)
-    is_vertical = False
-    if chars_per_col >= 2 and char_size >= 20:
-        is_vertical = True
-    elif h > w * 1.3 and cjk_count >= 2:
-        is_vertical = True
-        num_cols = 1
-        chars_per_col = cjk_count
+    # Rotate: PIL rotates counter-clockwise, so negate the angle
+    # For Chinese vertical text (angle ~90), we want the text to read top-to-bottom
+    # which means rotating -90 (clockwise 90)
+    rotated = txt_img.rotate(-angle, expand=True, resample=Image.Resampling.BICUBIC)
 
-    if not is_vertical:
-        return None
+    # Paste centered in box
+    rw, rh = rotated.size
+    paste_x = x1 + (box_w - rw) // 2
+    paste_y = y1 + (box_h - rh) // 2
 
-    return {
-        "columns": num_cols,
-        "chars_per_col": chars_per_col,
-        "char_size": char_size,
-        "is_vertical": True,
-    }
+    # Ensure we don't paste outside image
+    img_w, img_h = image.size
+    if paste_x < 0 or paste_y < 0 or paste_x + rw > img_w or paste_y + rh > img_h:
+        # Clip
+        crop_x = max(0, -paste_x)
+        crop_y = max(0, -paste_y)
+        crop_w = min(rw - crop_x, img_w - max(0, paste_x))
+        crop_h = min(rh - crop_y, img_h - max(0, paste_y))
+        rotated = rotated.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
+        paste_x = max(0, paste_x)
+        paste_y = max(0, paste_y)
+
+    image.paste(rotated, (paste_x, paste_y), rotated)
 
 
 def draw_text_box(
@@ -211,7 +491,6 @@ def draw_text_box(
         else:
             draw.rectangle(box, fill=bg)
 
-    # Binary search for font size
     lo, hi = min_size, max_size
     best_size = min_size
     while lo <= hi:
@@ -251,62 +530,9 @@ def draw_text_box(
     draw.multiline_text((tx, ty), text, **kwargs)
 
 
-def _draw_vertical_columns(
-    im: Image.Image,
-    box: tuple[int, int, int, int],
-    text: str,
-    layout: dict,
-    *,
-    fill: tuple[int, int, int],
-    stroke_width: int = 0,
-    stroke_fill: tuple[int, int, int] | None = None,
-) -> None:
-    """Render translated text rotated 90 degrees to match vertical Chinese layout."""
-    x1, y1, x2, y2 = box
-    box_w = x2 - x1
-    box_h = y2 - y1
-    char_size = layout.get('char_size', 30)
-
-    draw = ImageDraw.Draw(im)
-    # Font size based on original char size
-    font_size = max(10, min(TRANSLATION_FONT_MAX_SIZE, int(char_size * 0.75)))
-
-    # Find best font size: after rotation, text_width must fit box_h, text_height must fit box_w
-    best_fs = font_size
-    while best_fs > 8:
-        try:
-            fnt = ImageFont.truetype(str(FONT_BOLD), size=best_fs)
-        except OSError:
-            break
-        tbbox = draw.textbbox((0, 0), text, font=fnt)
-        tw = tbbox[2] - tbbox[0]
-        th = tbbox[3] - tbbox[1]
-        if tw <= box_h and th <= box_w:
-            break
-        best_fs -= 2
-
-    try:
-        fnt = ImageFont.truetype(str(FONT_BOLD), size=best_fs)
-    except OSError:
-        fnt = ImageFont.load_default()
-
-    # Render on transparent image
-    tbbox = draw.textbbox((0, 0), text, font=fnt)
-    tw = tbbox[2] - tbbox[0]
-    th = tbbox[3] - tbbox[1]
-    txt_img = Image.new('RGBA', (tw + 4, th + 4), (0, 0, 0, 0))
-    txt_draw = ImageDraw.Draw(txt_img)
-    txt_draw.text((2 - tbbox[0], 2 - tbbox[1]), text, font=fnt, fill=fill + (255,))
-
-    # Rotate 90 degrees clockwise
-    rotated = txt_img.rotate(-90, expand=True, resample=Image.Resampling.BICUBIC)
-
-    # Paste centered in box
-    rw, rh = rotated.size
-    paste_x = x1 + (box_w - rw) // 2
-    paste_y = y1 + (box_h - rh) // 2
-    im.paste(rotated, (paste_x, paste_y), rotated)
-
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN DETECTOR CLASS
+# ═══════════════════════════════════════════════════════════════════════
 
 class ResidualChineseDetector:
     def __init__(self) -> None:
@@ -433,96 +659,39 @@ class ResidualChineseDetector:
             repaired=tuple(brand_hits), remaining=remaining,
         )
 
-    def _translation_for(self, hit: ChineseHit, translator: MalayTranslator | None) -> str | None:
-        normalized = normalize_text(hit.text)
-        direct = NORMALIZED_TRANSLATIONS.get(normalized)
-        if direct is not None and hit.confidence >= 0.50:
-            return polish_malaysia_ecommerce(direct, source_text=hit.text)
-        if hit.confidence < 0.60:
-            return None
-        source_without_brand = self._brand_policy.remove_known_terms(hit.text)
-        if source_without_brand != hit.text:
-            if not source_without_brand:
-                return ""
-            normalized = normalize_text(source_without_brand)
-            direct = NORMALIZED_TRANSLATIONS.get(normalized)
-            if direct is not None:
-                return polish_malaysia_ecommerce(direct, source_text=source_without_brand)
-        if translator is None:
-            return None
-        result = translator.translate(hit.text)
-        return result
-
     def _apply_replacements(self, image: Image.Image, replacements: list[tuple[ChineseHit, str]]) -> None:
-        # Sample text colors BEFORE inpainting
-        text_colors = {}
+        """Apply translations using layout-aware rendering."""
+        # Extract layout BEFORE inpainting (need original pixels)
+        layouts = {}
         for hit, translation in replacements:
             if translation:
-                text_colors[hit.box] = self._sample_text_color(image, hit.box)
+                layouts[hit.box] = extract_layout(image, hit)
 
+        # Inpaint all regions
         self._inpaint_hits(image, [hit for hit, _ in replacements])
 
+        # Render with extracted layout
         for hit, translation in replacements:
             if not translation:
                 continue
-
-            box_w = hit.box[2] - hit.box[0]
-            box_h = hit.box[3] - hit.box[1]
-
-            bg = self._sample_background(image, hit.box)
-            bg_lum = self._luminance(bg)
-
-            # Determine foreground color
-            orig_color = text_colors.get(hit.box)
-            if orig_color and abs(self._luminance(orig_color) - bg_lum) > 60:
-                fg = orig_color
-            elif bg_lum >= 145:
-                fg = (30, 30, 30)
+            layout = layouts.get(hit.box)
+            if layout:
+                render_text_with_layout(image, hit.box, translation, layout)
             else:
-                fg = (255, 255, 255)
-
-            # Stroke only if contrast is very poor
-            contrast = abs(self._luminance(fg) - bg_lum)
-            if contrast < 50:
-                stroke_fill = (255, 255, 255) if bg_lum >= 145 else (0, 0, 0)
-                stroke_w = 1
-            else:
-                stroke_w = 0
-                stroke_fill = None
-
-            # Check vertical layout
-            vlayout = _analyze_vertical_layout(hit.box, hit.text)
-
-            if vlayout:
-                # Vertical text: render in columns matching original layout
-                _draw_vertical_columns(
-                    image, hit.box, translation, vlayout,
-                    fill=fg, stroke_width=stroke_w, stroke_fill=stroke_fill,
-                )
-            else:
-                # Horizontal text: standard rendering
+                # Fallback: horizontal rendering
+                box_h = hit.box[3] - hit.box[1]
                 max_size = max(10, min(TRANSLATION_FONT_MAX_SIZE, int(box_h * 0.82)))
                 expanded_box = self._expand_box(hit.box, image.size)
-                draw_text_box(
-                    image, expanded_box, translation, fill=fg, max_size=max_size,
-                    min_size=8, pad=4, stroke_width=stroke_w, stroke_fill=stroke_fill,
-                )
+                draw_text_box(image, expanded_box, translation, fill=(30, 30, 30), max_size=max_size)
 
     def apply_vision_replacements(self, image: Image.Image, vision_data: list) -> tuple:
-        """Apply translations from Qwen-VL vision analysis with proper layout.
+        """Apply translations from Qwen-VL vision analysis with layout-aware rendering.
 
-        Args:
-            image: PIL Image to modify in-place
-            vision_data: list of dicts from Qwen-VL with box, text, translation,
-                        orientation, color, font_size
-
-        Returns:
-            (modified_image, count_of_replacements)
+        Returns (modified_image, count_of_replacements).
         """
         edited = image.copy().convert("RGB")
         count = 0
 
-        # Build pseudo-hits for inpainting
         hits_to_inpaint = []
         render_tasks = []
 
@@ -532,7 +701,6 @@ class ResidualChineseDetector:
                 if len(box) != 4:
                     continue
                 x1, y1, x2, y2 = [int(v) for v in box]
-                # Clamp to image bounds
                 w, h = edited.size
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w, x2), min(h, y2)
@@ -541,7 +709,6 @@ class ResidualChineseDetector:
 
                 translation = item.get("translation", "")
                 if not translation:
-                    # Brand/logo - just inpaint to remove
                     hits_to_inpaint.append(ChineseHit(
                         text=item.get("text", ""),
                         confidence=0.9,
@@ -550,15 +717,34 @@ class ResidualChineseDetector:
                     ))
                     continue
 
+                # Build layout from vision data
                 orientation = item.get("orientation", "horizontal")
-                color = item.get("color", [30, 30, 30])
+                color = item.get("color", None)
                 if isinstance(color, list) and len(color) == 3:
                     fg = tuple(int(c) for c in color)
                 else:
-                    fg = (30, 30, 30)
+                    fg = _sample_text_color_from_image(edited, (x1, y1, x2, y2)) or (30, 30, 30)
+
                 font_size = item.get("font_size", 20)
                 if not isinstance(font_size, (int, float)) or font_size < 8:
                     font_size = 20
+
+                # Determine angle from orientation
+                if orientation == "vertical":
+                    angle = 90.0
+                else:
+                    angle = 0.0
+
+                is_bold = _detect_boldness(edited, (x1, y1, x2, y2))
+
+                layout = TextLayout(
+                    angle=angle,
+                    font_size=int(font_size),
+                    color=fg,
+                    is_bold=is_bold,
+                    box=(x1, y1, x2, y2),
+                    line_count=1,
+                )
 
                 hits_to_inpaint.append(ChineseHit(
                     text=item.get("text", ""),
@@ -566,125 +752,22 @@ class ResidualChineseDetector:
                     box=(x1, y1, x2, y2),
                     polygon=((x1, y1), (x2, y1), (x2, y2), (x1, y2)),
                 ))
-                render_tasks.append({
-                    "box": (x1, y1, x2, y2),
-                    "translation": translation,
-                    "orientation": orientation,
-                    "color": fg,
-                    "font_size": int(font_size),
-                })
+                render_tasks.append((box, translation, layout))
             except (ValueError, TypeError, KeyError) as e:
                 LOGGER.warning("Vision item parse error: %s", e)
                 continue
 
-        # Inpaint all regions
+        # Inpaint all regions first
         if hits_to_inpaint:
             self._inpaint_hits(edited, hits_to_inpaint)
 
-        # Render translations with proper layout
-        draw = ImageDraw.Draw(edited)
-        for task in render_tasks:
-            box = task["box"]
-            translation = task["translation"]
-            orientation = task["orientation"]
-            fg = task["color"]
-            font_size = task["font_size"]
-
-            x1, y1, x2, y2 = box
-            box_w = x2 - x1
-            box_h = y2 - y1
-
-            # Cap font size to box dimensions
-            if orientation == "vertical":
-                # For vertical: font_size should fit in column width
-                max_fs = min(font_size, box_w - 4, box_h // 2)
-            else:
-                max_fs = min(font_size, box_h - 4)
-            max_fs = max(10, max_fs)
-
-            try:
-                fnt = ImageFont.truetype(str(FONT_BOLD), size=max_fs)
-            except OSError:
-                fnt = ImageFont.load_default()
-
-            if orientation == "vertical":
-                # Render text horizontally then rotate 90 degrees CW
-                # This matches Chinese vertical text layout (read top-to-bottom)
-                # First find font size: after rotation, text width becomes height
-                # So text_width must fit in box_h, and text_height must fit in box_w
-                best_fs = max_fs
-                while best_fs > 8:
-                    try:
-                        fnt = ImageFont.truetype(str(FONT_BOLD), size=best_fs)
-                    except OSError:
-                        break
-                    tbbox = draw.textbbox((0, 0), translation, font=fnt)
-                    tw = tbbox[2] - tbbox[0]
-                    th = tbbox[3] - tbbox[1]
-                    # After 90 CW rotation: tw -> height, th -> width
-                    if tw <= box_h and th <= box_w:
-                        break
-                    best_fs -= 2
-
-                try:
-                    fnt = ImageFont.truetype(str(FONT_BOLD), size=best_fs)
-                except OSError:
-                    fnt = ImageFont.load_default()
-
-                # Render on transparent image
-                tbbox = draw.textbbox((0, 0), translation, font=fnt)
-                tw = tbbox[2] - tbbox[0]
-                th = tbbox[3] - tbbox[1]
-                # Create RGBA image for text
-                txt_img = Image.new("RGBA", (tw + 4, th + 4), (0, 0, 0, 0))
-                txt_draw = ImageDraw.Draw(txt_img)
-                txt_draw.text((2 - tbbox[0], 2 - tbbox[1]), translation, font=fnt, fill=fg + (255,))
-
-                # Rotate 90 degrees clockwise (Chinese vertical reads top-to-bottom,
-                # which corresponds to rotating horizontal text 90 CW)
-                rotated = txt_img.rotate(-90, expand=True, resample=Image.Resampling.BICUBIC)
-
-                # Paste centered in box
-                rw, rh = rotated.size
-                paste_x = x1 + (box_w - rw) // 2
-                paste_y = y1 + (box_h - rh) // 2
-                edited.paste(rotated, (paste_x, paste_y), rotated)
-            else:
-                # Horizontal: use draw_text_box
-                draw_text_box(
-                    edited, box, translation, fill=fg,
-                    max_size=max_fs, min_size=8, pad=2,
-                )
-
+        # Render with layout
+        for box, translation, layout in render_tasks:
+            render_text_with_layout(edited, tuple(box), translation, layout)
             count += 1
 
         LOGGER.info("Vision replacements applied: %d regions", count)
         return edited, count
-
-    @staticmethod
-    def _sample_text_color(image: Image.Image, box: tuple[int, int, int, int]) -> tuple[int, int, int] | None:
-        """Sample the dominant text color from within the bounding box."""
-        x1, y1, x2, y2 = box
-        w, h = image.size
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        if x2 <= x1 or y2 <= y1:
-            return None
-        region = np.asarray(image.crop((x1, y1, x2, y2)).convert("RGB"))
-        if region.size == 0:
-            return None
-        flat = region.reshape(-1, 3)
-        luminances = 0.299 * flat[:, 0] + 0.587 * flat[:, 1] + 0.114 * flat[:, 2]
-        median_lum = float(np.median(luminances))
-        if median_lum >= 128:
-            mask = luminances < median_lum * 0.6
-        else:
-            mask = luminances > median_lum * 1.5
-        text_pixels = flat[mask]
-        if len(text_pixels) < 3:
-            return None
-        avg = text_pixels.mean(axis=0).astype(int)
-        return (int(avg[0]), int(avg[1]), int(avg[2]))
 
     def _inpaint_hits(self, image: Image.Image, hits: list[ChineseHit]) -> None:
         pixels = np.asarray(image.convert("RGB")).copy()
