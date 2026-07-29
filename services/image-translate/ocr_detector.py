@@ -21,8 +21,6 @@ LOGGER = logging.getLogger("image_translate.ocr")
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 TRANSLATION_BOX_SCALE = 1.18
 TRANSLATION_FONT_MAX_SIZE = 72
-# Vertical text: if box height / width > this ratio, treat as vertical
-VERTICAL_RATIO_THRESHOLD = 1.4
 
 
 @dataclass(frozen=True)
@@ -119,24 +117,62 @@ NORMALIZED_TRANSLATIONS = {
 }
 
 
-def _is_vertical_text(box: tuple[int, int, int, int], text: str) -> bool:
-    """Detect if the text region is vertical layout."""
+def _analyze_vertical_layout(box: tuple[int, int, int, int], text: str) -> dict | None:
+    """Analyze if text is vertical layout. Returns layout info or None.
+    
+    Returns dict with:
+      - columns: number of vertical columns
+      - chars_per_col: chars in each column
+      - char_size: estimated pixel size of each character
+      - is_vertical: True
+    """
     x1, y1, x2, y2 = box
     w = x2 - x1
     h = y2 - y1
     if w <= 0 or h <= 0:
-        return False
-    ratio = h / w
-    # Vertical if height >> width, or if char count matches vertical stacking
-    if ratio >= VERTICAL_RATIO_THRESHOLD:
-        return True
-    # Also check: if number of CJK chars * estimated char width ~ height
-    cjk_count = len(CJK_RE.findall(text))
-    if cjk_count >= 3 and h > w * 1.2:
-        char_h = h / cjk_count
-        if abs(char_h - w) < w * 0.5:  # each char is roughly square
-            return True
-    return False
+        return None
+
+    cjk_chars = CJK_RE.findall(text)
+    cjk_count = len(cjk_chars)
+    if cjk_count < 2:
+        return None
+
+    # Estimate character size: in vertical Chinese text, each char is roughly square
+    # If text is vertical with N columns of M chars each:
+    #   char_size ≈ h / M  and  w ≈ N * char_size
+    # So: M = h / char_size, N = w / char_size
+    # And: cjk_count = N * M = (w * h) / char_size^2
+    # Therefore: char_size = sqrt(w * h / cjk_count)
+    char_size = math.sqrt(w * h / cjk_count)
+
+    # Number of columns = w / char_size (rounded)
+    num_cols = max(1, round(w / char_size))
+    chars_per_col = max(1, round(h / char_size))
+
+    # Validate: char_size should be reasonable (at least 15px)
+    if char_size < 15:
+        return None
+
+    # Check if this looks like vertical layout:
+    # - Multiple chars stacked (chars_per_col >= 2), OR
+    # - Box is taller than wide (single column vertical)
+    is_vertical = False
+    if chars_per_col >= 2 and char_size >= 20:
+        is_vertical = True
+    elif h > w * 1.3 and cjk_count >= 2:
+        is_vertical = True
+        num_cols = 1
+        chars_per_col = cjk_count
+
+    if not is_vertical:
+        return None
+
+    return {
+        "columns": num_cols,
+        "chars_per_col": chars_per_col,
+        "char_size": char_size,
+        "is_vertical": True,
+    }
 
 
 def draw_text_box(
@@ -153,13 +189,8 @@ def draw_text_box(
     pad: int = 4,
     stroke_width: int = 0,
     stroke_fill: tuple[int, int, int] | None = None,
-    vertical: bool = False,
 ) -> None:
-    """Draw text within a bounding box, auto-fitting font size.
-    
-    If vertical=True, renders text as one word per line (stacked vertically)
-    to match vertical Chinese layout.
-    """
+    """Draw text within a bounding box, auto-fitting font size (horizontal)."""
     if not text:
         if bg is not None:
             draw = ImageDraw.Draw(im)
@@ -180,13 +211,7 @@ def draw_text_box(
         else:
             draw.rectangle(box, fill=bg)
 
-    if vertical:
-        _draw_vertical_text(draw, im, box, text, fill=fill, max_size=max_size,
-                           min_size=min_size, pad=pad, stroke_width=stroke_width,
-                           stroke_fill=stroke_fill)
-        return
-
-    # Horizontal text: binary search for font size
+    # Binary search for font size
     lo, hi = min_size, max_size
     best_size = min_size
     while lo <= hi:
@@ -226,92 +251,83 @@ def draw_text_box(
     draw.multiline_text((tx, ty), text, **kwargs)
 
 
-def _draw_vertical_text(
-    draw: ImageDraw.ImageDraw,
+def _draw_vertical_columns(
     im: Image.Image,
     box: tuple[int, int, int, int],
     text: str,
+    layout: dict,
     *,
     fill: tuple[int, int, int],
-    max_size: int,
-    min_size: int,
-    pad: int,
     stroke_width: int = 0,
     stroke_fill: tuple[int, int, int] | None = None,
 ) -> None:
-    """Render text vertically: one word per line, centered in box.
+    """Render translated text in vertical columns matching original Chinese layout.
     
-    For Malay/Latin text in a vertical Chinese layout, we stack words
-    vertically with each word on its own line, using a font size that
-    matches the original character size.
+    Strategy: Split translation words into N columns (matching original column count).
+    Each column renders words stacked vertically (one word per line).
+    Font size is derived from original character size.
     """
     x1, y1, x2, y2 = box
-    box_w = max(1, x2 - x1 - pad * 2)
-    box_h = max(1, y2 - y1 - pad * 2)
+    box_w = x2 - x1
+    box_h = y2 - y1
+    num_cols = layout["columns"]
+    char_size = layout["char_size"]
 
-    # Split text into words for vertical stacking
+    draw = ImageDraw.Draw(im)
     words = text.split()
     if not words:
         return
 
-    # Binary search for font size that fits all words stacked vertically
-    lo, hi = min_size, max_size
-    best_size = min_size
-    line_spacing_ratio = 0.25  # extra spacing between lines as fraction of font size
-
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        try:
-            fnt = ImageFont.truetype(str(FONT_BOLD), size=mid)
-        except OSError:
-            fnt = ImageFont.load_default()
-        # Check: widest word must fit in box_w, total height must fit in box_h
-        max_word_w = 0
-        total_h = 0
-        for i, word in enumerate(words):
-            wbbox = draw.textbbox((0, 0), word, font=fnt)
-            ww = wbbox[2] - wbbox[0]
-            wh = wbbox[3] - wbbox[1]
-            max_word_w = max(max_word_w, ww)
-            total_h += wh
-            if i < len(words) - 1:
-                total_h += int(mid * line_spacing_ratio)
-        if max_word_w <= box_w and total_h <= box_h:
-            best_size = mid
-            lo = mid + 1
-        else:
-            hi = mid - 1
-
+    # Font size: use original char_size as basis, slightly smaller for Latin text
+    # Latin chars are wider than CJK, so use ~70% of char_size
+    font_size = max(12, min(TRANSLATION_FONT_MAX_SIZE, int(char_size * 0.70)))
     try:
-        fnt = ImageFont.truetype(str(FONT_BOLD), size=best_size)
+        fnt = ImageFont.truetype(str(FONT_BOLD), size=font_size)
     except OSError:
         fnt = ImageFont.load_default()
 
-    # Calculate total height for centering
-    line_heights = []
-    line_widths = []
-    for word in words:
-        wbbox = draw.textbbox((0, 0), word, font=fnt)
-        line_widths.append(wbbox[2] - wbbox[0])
-        line_heights.append(wbbox[3] - wbbox[1])
-    spacing = int(best_size * line_spacing_ratio)
-    total_h = sum(line_heights) + spacing * (len(words) - 1)
+    # Distribute words across columns as evenly as possible
+    cols_words: list[list[str]] = [[] for _ in range(num_cols)]
+    for i, word in enumerate(words):
+        cols_words[i % num_cols].append(word)
 
-    # Start Y: vertically centered
-    cy = y1 + pad + (box_h - total_h) // 2
-    cx = x1 + pad + box_w // 2
+    # Column width
+    col_w = box_w / num_cols
 
+    # Render each column
     kwargs: dict = {"font": fnt, "fill": fill}
     if stroke_width > 0 and stroke_fill:
         kwargs["stroke_width"] = stroke_width
         kwargs["stroke_fill"] = stroke_fill
 
-    for i, word in enumerate(words):
-        ww = line_widths[i]
-        # Horizontally center each word
-        wx = cx - ww // 2
-        draw.text((wx, cy), word, **kwargs)
-        cy += line_heights[i] + spacing
+    for col_idx, col_words in enumerate(cols_words):
+        if not col_words:
+            continue
+        # Column horizontal center
+        col_cx = x1 + int(col_w * col_idx + col_w / 2)
+
+        # Calculate total height of this column's words
+        line_heights = []
+        line_widths = []
+        for word in col_words:
+            wbbox = draw.textbbox((0, 0), word, font=fnt)
+            line_widths.append(wbbox[2] - wbbox[0])
+            line_heights.append(wbbox[3] - wbbox[1])
+
+        spacing = max(4, int(font_size * 0.3))
+        total_h = sum(line_heights) + spacing * (len(col_words) - 1)
+
+        # Start Y: vertically centered in box
+        cy = y1 + (box_h - total_h) // 2
+
+        for i, word in enumerate(col_words):
+            ww = line_widths[i]
+            # Horizontally center word within column
+            wx = col_cx - ww // 2
+            # Clamp to box bounds
+            wx = max(x1 + 2, min(wx, x2 - ww - 2))
+            draw.text((wx, cy), word, **kwargs)
+            cy += line_heights[i] + spacing
 
 
 class ResidualChineseDetector:
@@ -383,7 +399,7 @@ class ResidualChineseDetector:
     ) -> list[tuple[ChineseHit, str]]:
         """Translate hits using batch API for efficiency."""
         replacements: list[tuple[ChineseHit, str]] = []
-        needs_api: list[tuple[ChineseHit, str]] = []  # (hit, source_text)
+        needs_api: list[tuple[ChineseHit, str]] = []
 
         for hit in hits:
             normalized = normalize_text(hit.text)
@@ -393,7 +409,6 @@ class ResidualChineseDetector:
                 continue
             if hit.confidence < 0.60:
                 continue
-            # Try removing brand terms
             source_without_brand = self._brand_policy.remove_known_terms(hit.text)
             if source_without_brand != hit.text:
                 if not source_without_brand:
@@ -404,10 +419,8 @@ class ResidualChineseDetector:
                 if direct2 is not None:
                     replacements.append((hit, polish_malaysia_ecommerce(direct2, source_text=source_without_brand)))
                     continue
-            # Needs API translation
             needs_api.append((hit, hit.text))
 
-        # Batch translate via Qwen
         if needs_api and translator is not None:
             texts = [src for _, src in needs_api]
             batch_results = translator.translate_batch(texts)
@@ -416,7 +429,6 @@ class ResidualChineseDetector:
                 if translation:
                     replacements.append((hit, translation))
                 else:
-                    # Fallback to individual translate
                     result = translator.translate(hit.text)
                     if result:
                         replacements.append((hit, result))
@@ -450,7 +462,6 @@ class ResidualChineseDetector:
             return polish_malaysia_ecommerce(direct, source_text=hit.text)
         if hit.confidence < 0.60:
             return None
-        # Try removing brand terms
         source_without_brand = self._brand_policy.remove_known_terms(hit.text)
         if source_without_brand != hit.text:
             if not source_without_brand:
@@ -459,14 +470,13 @@ class ResidualChineseDetector:
             direct = NORMALIZED_TRANSLATIONS.get(normalized)
             if direct is not None:
                 return polish_malaysia_ecommerce(direct, source_text=source_without_brand)
-        # Use translator
         if translator is None:
             return None
         result = translator.translate(hit.text)
         return result
 
     def _apply_replacements(self, image: Image.Image, replacements: list[tuple[ChineseHit, str]]) -> None:
-        # Sample text colors BEFORE inpainting (original text pixels)
+        # Sample text colors BEFORE inpainting
         text_colors = {}
         for hit, translation in replacements:
             if translation:
@@ -480,21 +490,20 @@ class ResidualChineseDetector:
 
             box_w = hit.box[2] - hit.box[0]
             box_h = hit.box[3] - hit.box[1]
-            is_vertical = _is_vertical_text(hit.box, hit.text)
 
             bg = self._sample_background(image, hit.box)
             bg_lum = self._luminance(bg)
 
-            # Use sampled original text color if it has good contrast, else auto
+            # Determine foreground color
             orig_color = text_colors.get(hit.box)
             if orig_color and abs(self._luminance(orig_color) - bg_lum) > 60:
                 fg = orig_color
             elif bg_lum >= 145:
-                fg = (30, 30, 30)  # Dark text on light bg
+                fg = (30, 30, 30)
             else:
-                fg = (255, 255, 255)  # White text on dark bg
+                fg = (255, 255, 255)
 
-            # NO stroke by default - only add if contrast is truly poor (< 50 luminance diff)
+            # Stroke only if contrast is very poor
             contrast = abs(self._luminance(fg) - bg_lum)
             if contrast < 50:
                 stroke_fill = (255, 255, 255) if bg_lum >= 145 else (0, 0, 0)
@@ -503,26 +512,17 @@ class ResidualChineseDetector:
                 stroke_w = 0
                 stroke_fill = None
 
-            if is_vertical:
-                # For vertical text: use per-character size from original
-                cjk_count = max(1, len(CJK_RE.findall(hit.text)))
-                char_size = box_h // cjk_count
-                # Font size should match original character size (with some scaling)
-                max_size = max(14, min(TRANSLATION_FONT_MAX_SIZE, int(char_size * 0.95)))
-                # Expand box: keep same height, widen to fit horizontal words
-                # Use 3x original width or at least enough for the longest word
-                expanded_w = max(box_w * 3, int(box_h * 0.4))
-                cx = (hit.box[0] + hit.box[2]) // 2
-                left = max(0, cx - expanded_w // 2)
-                right = min(image.size[0], left + expanded_w)
-                expanded_box = (left, hit.box[1], right, hit.box[3])
-                draw_text_box(
-                    image, expanded_box, translation, fill=fg, max_size=max_size,
-                    min_size=10, pad=2, stroke_width=stroke_w, stroke_fill=stroke_fill,
-                    vertical=True,
+            # Check vertical layout
+            vlayout = _analyze_vertical_layout(hit.box, hit.text)
+
+            if vlayout:
+                # Vertical text: render in columns matching original layout
+                _draw_vertical_columns(
+                    image, hit.box, translation, vlayout,
+                    fill=fg, stroke_width=stroke_w, stroke_fill=stroke_fill,
                 )
             else:
-                # Horizontal text: use box height for font sizing
+                # Horizontal text: standard rendering
                 max_size = max(10, min(TRANSLATION_FONT_MAX_SIZE, int(box_h * 0.82)))
                 expanded_box = self._expand_box(hit.box, image.size)
                 draw_text_box(
@@ -532,7 +532,7 @@ class ResidualChineseDetector:
 
     @staticmethod
     def _sample_text_color(image: Image.Image, box: tuple[int, int, int, int]) -> tuple[int, int, int] | None:
-        """Sample the dominant text color from within the bounding box (before inpainting)."""
+        """Sample the dominant text color from within the bounding box."""
         x1, y1, x2, y2 = box
         w, h = image.size
         x1, y1 = max(0, x1), max(0, y1)
@@ -542,20 +542,16 @@ class ResidualChineseDetector:
         region = np.asarray(image.crop((x1, y1, x2, y2)).convert("RGB"))
         if region.size == 0:
             return None
-        # Find darkest pixels (likely text on light bg) or lightest (text on dark bg)
         flat = region.reshape(-1, 3)
         luminances = 0.299 * flat[:, 0] + 0.587 * flat[:, 1] + 0.114 * flat[:, 2]
         median_lum = float(np.median(luminances))
         if median_lum >= 128:
-            # Light background - text is likely dark
             mask = luminances < median_lum * 0.6
         else:
-            # Dark background - text is likely light
             mask = luminances > median_lum * 1.5
         text_pixels = flat[mask]
         if len(text_pixels) < 3:
             return None
-        # Average of text pixels
         avg = text_pixels.mean(axis=0).astype(int)
         return (int(avg[0]), int(avg[1]), int(avg[2]))
 
@@ -573,7 +569,6 @@ class ResidualChineseDetector:
                 continue
             roi = pixels[top:bottom, left:right]
             mask = np.zeros(roi.shape[:2], dtype=np.uint8)
-            # Create mask from polygon
             pts = np.array(hit.polygon, dtype=np.int32)
             pts[:, 0] -= left
             pts[:, 1] -= top
