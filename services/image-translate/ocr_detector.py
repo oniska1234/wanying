@@ -261,73 +261,51 @@ def _draw_vertical_columns(
     stroke_width: int = 0,
     stroke_fill: tuple[int, int, int] | None = None,
 ) -> None:
-    """Render translated text in vertical columns matching original Chinese layout.
-    
-    Strategy: Split translation words into N columns (matching original column count).
-    Each column renders words stacked vertically (one word per line).
-    Font size is derived from original character size.
-    """
+    """Render translated text rotated 90 degrees to match vertical Chinese layout."""
     x1, y1, x2, y2 = box
     box_w = x2 - x1
     box_h = y2 - y1
-    num_cols = layout["columns"]
-    char_size = layout["char_size"]
+    char_size = layout.get('char_size', 30)
 
     draw = ImageDraw.Draw(im)
-    words = text.split()
-    if not words:
-        return
+    # Font size based on original char size
+    font_size = max(10, min(TRANSLATION_FONT_MAX_SIZE, int(char_size * 0.75)))
 
-    # Font size: use original char_size as basis, slightly smaller for Latin text
-    # Latin chars are wider than CJK, so use ~70% of char_size
-    font_size = max(12, min(TRANSLATION_FONT_MAX_SIZE, int(char_size * 0.70)))
+    # Find best font size: after rotation, text_width must fit box_h, text_height must fit box_w
+    best_fs = font_size
+    while best_fs > 8:
+        try:
+            fnt = ImageFont.truetype(str(FONT_BOLD), size=best_fs)
+        except OSError:
+            break
+        tbbox = draw.textbbox((0, 0), text, font=fnt)
+        tw = tbbox[2] - tbbox[0]
+        th = tbbox[3] - tbbox[1]
+        if tw <= box_h and th <= box_w:
+            break
+        best_fs -= 2
+
     try:
-        fnt = ImageFont.truetype(str(FONT_BOLD), size=font_size)
+        fnt = ImageFont.truetype(str(FONT_BOLD), size=best_fs)
     except OSError:
         fnt = ImageFont.load_default()
 
-    # Distribute words across columns as evenly as possible
-    cols_words: list[list[str]] = [[] for _ in range(num_cols)]
-    for i, word in enumerate(words):
-        cols_words[i % num_cols].append(word)
+    # Render on transparent image
+    tbbox = draw.textbbox((0, 0), text, font=fnt)
+    tw = tbbox[2] - tbbox[0]
+    th = tbbox[3] - tbbox[1]
+    txt_img = Image.new('RGBA', (tw + 4, th + 4), (0, 0, 0, 0))
+    txt_draw = ImageDraw.Draw(txt_img)
+    txt_draw.text((2 - tbbox[0], 2 - tbbox[1]), text, font=fnt, fill=fill + (255,))
 
-    # Column width
-    col_w = box_w / num_cols
+    # Rotate 90 degrees clockwise
+    rotated = txt_img.rotate(-90, expand=True, resample=Image.Resampling.BICUBIC)
 
-    # Render each column
-    kwargs: dict = {"font": fnt, "fill": fill}
-    if stroke_width > 0 and stroke_fill:
-        kwargs["stroke_width"] = stroke_width
-        kwargs["stroke_fill"] = stroke_fill
-
-    for col_idx, col_words in enumerate(cols_words):
-        if not col_words:
-            continue
-        # Column horizontal center
-        col_cx = x1 + int(col_w * col_idx + col_w / 2)
-
-        # Calculate total height of this column's words
-        line_heights = []
-        line_widths = []
-        for word in col_words:
-            wbbox = draw.textbbox((0, 0), word, font=fnt)
-            line_widths.append(wbbox[2] - wbbox[0])
-            line_heights.append(wbbox[3] - wbbox[1])
-
-        spacing = max(4, int(font_size * 0.3))
-        total_h = sum(line_heights) + spacing * (len(col_words) - 1)
-
-        # Start Y: vertically centered in box
-        cy = y1 + (box_h - total_h) // 2
-
-        for i, word in enumerate(col_words):
-            ww = line_widths[i]
-            # Horizontally center word within column
-            wx = col_cx - ww // 2
-            # Clamp to box bounds
-            wx = max(x1 + 2, min(wx, x2 - ww - 2))
-            draw.text((wx, cy), word, **kwargs)
-            cy += line_heights[i] + spacing
+    # Paste centered in box
+    rw, rh = rotated.size
+    paste_x = x1 + (box_w - rw) // 2
+    paste_y = y1 + (box_h - rh) // 2
+    im.paste(rotated, (paste_x, paste_y), rotated)
 
 
 class ResidualChineseDetector:
@@ -630,47 +608,47 @@ class ResidualChineseDetector:
                 fnt = ImageFont.load_default()
 
             if orientation == "vertical":
-                # Render words stacked vertically, one per line
-                words = translation.split()
-                if not words:
-                    continue
-                # Check if all words fit at this font size
-                # If not, reduce font size
-                while max_fs > 10:
+                # Render text horizontally then rotate 90 degrees CW
+                # This matches Chinese vertical text layout (read top-to-bottom)
+                # First find font size: after rotation, text width becomes height
+                # So text_width must fit in box_h, and text_height must fit in box_w
+                best_fs = max_fs
+                while best_fs > 8:
                     try:
-                        fnt = ImageFont.truetype(str(FONT_BOLD), size=max_fs)
+                        fnt = ImageFont.truetype(str(FONT_BOLD), size=best_fs)
                     except OSError:
                         break
-                    max_ww = max(draw.textbbox((0, 0), w, font=fnt)[2] - draw.textbbox((0, 0), w, font=fnt)[0] for w in words)
-                    spacing = max(3, int(max_fs * 0.25))
-                    total_h = sum(draw.textbbox((0, 0), w, font=fnt)[3] - draw.textbbox((0, 0), w, font=fnt)[1] for w in words) + spacing * (len(words) - 1)
-                    if max_ww <= box_w and total_h <= box_h:
+                    tbbox = draw.textbbox((0, 0), translation, font=fnt)
+                    tw = tbbox[2] - tbbox[0]
+                    th = tbbox[3] - tbbox[1]
+                    # After 90 CW rotation: tw -> height, th -> width
+                    if tw <= box_h and th <= box_w:
                         break
-                    max_fs -= 2
+                    best_fs -= 2
 
                 try:
-                    fnt = ImageFont.truetype(str(FONT_BOLD), size=max_fs)
+                    fnt = ImageFont.truetype(str(FONT_BOLD), size=best_fs)
                 except OSError:
                     fnt = ImageFont.load_default()
 
-                # Calculate positions
-                line_info = []
-                for word in words:
-                    wbbox = draw.textbbox((0, 0), word, font=fnt)
-                    ww = wbbox[2] - wbbox[0]
-                    wh = wbbox[3] - wbbox[1]
-                    line_info.append((word, ww, wh))
-                spacing = max(3, int(max_fs * 0.25))
-                total_h = sum(h for _, _, h in line_info) + spacing * (len(line_info) - 1)
+                # Render on transparent image
+                tbbox = draw.textbbox((0, 0), translation, font=fnt)
+                tw = tbbox[2] - tbbox[0]
+                th = tbbox[3] - tbbox[1]
+                # Create RGBA image for text
+                txt_img = Image.new("RGBA", (tw + 4, th + 4), (0, 0, 0, 0))
+                txt_draw = ImageDraw.Draw(txt_img)
+                txt_draw.text((2 - tbbox[0], 2 - tbbox[1]), translation, font=fnt, fill=fg + (255,))
 
-                # Vertically center
-                cy = y1 + (box_h - total_h) // 2
-                cx = x1 + box_w // 2
+                # Rotate 90 degrees clockwise (Chinese vertical reads top-to-bottom,
+                # which corresponds to rotating horizontal text 90 CW)
+                rotated = txt_img.rotate(-90, expand=True, resample=Image.Resampling.BICUBIC)
 
-                for word, ww, wh in line_info:
-                    wx = cx - ww // 2
-                    draw.text((wx, cy), word, font=fnt, fill=fg)
-                    cy += wh + spacing
+                # Paste centered in box
+                rw, rh = rotated.size
+                paste_x = x1 + (box_w - rw) // 2
+                paste_y = y1 + (box_h - rh) // 2
+                edited.paste(rotated, (paste_x, paste_y), rotated)
             else:
                 # Horizontal: use draw_text_box
                 draw_text_box(
