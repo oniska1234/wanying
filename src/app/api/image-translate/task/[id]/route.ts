@@ -37,6 +37,13 @@ export async function GET(req: NextRequest, { params }: Props) {
           where: { id },
           data: { status: newStatus, doneCount: data.done, failedCount: data.failed },
         });
+        // P1-401: If task failed, mark all pending items as failed too
+        if (newStatus === "failed") {
+          await prisma.imageTranslateItem.updateMany({
+            where: { taskId: id, status: "pending" },
+            data: { status: "failed", error: "服务重启导致任务中断，请重新上传" },
+          });
+        }
         // Update items from results - match by sourceKey (UUID-based)
         if (data.results?.length) {
           for (const r of data.results) {
@@ -67,7 +74,11 @@ export async function GET(req: NextRequest, { params }: Props) {
         if (checkResp.status === 404) {
           await prisma.imageTranslateTask.update({
             where: { id },
-            data: { status: "failed", report: "服务重启导致任务中断，请重新上传" },
+            data: { status: "failed", report: "服务重启导致任务中断，请重新上传", failedCount: task.totalCount - task.doneCount },
+          });
+          await prisma.imageTranslateItem.updateMany({
+            where: { taskId: id, status: "pending" },
+            data: { status: "failed", error: "服务重启导致任务中断，请重新上传" },
           });
           task.status = "failed";
         }

@@ -40,3 +40,5 @@ services/image-translate/tasks.db
 services/image-translate/tmp/
 services/image-translate/logs/
 services/image-translate/venv/
+services/image-translate/__pycache__/
+docs/qa/

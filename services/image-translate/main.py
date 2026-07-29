@@ -98,15 +98,31 @@ def _db_task_exists(task_id: str) -> bool:
 
 
 def _db_recover_stale_tasks() -> int:
-    """On startup, mark any processing/pending tasks as failed (temp files are gone)."""
+    """On startup, mark stale tasks as failed with proper counts, and clean temp dirs."""
     with _db_lock:
         conn = _get_db()
         try:
-            cursor = conn.execute(
-                "UPDATE tasks SET status = 'failed' WHERE status IN ('pending', 'processing')"
-            )
+            # Find all stale tasks
+            rows = conn.execute(
+                "SELECT task_id, total, done, results FROM tasks WHERE status IN ('pending', 'processing')"
+            ).fetchall()
+            if not rows:
+                return 0
+            for task_id, total, done, results_json in rows:
+                remaining = total - done
+                results = json.loads(results_json) if results_json else []
+                results.append({"file": "*", "status": "failed", "error": "服务重启导致任务中断，请重新上传"})
+                conn.execute(
+                    "UPDATE tasks SET status = 'failed', failed = ?, results = ? WHERE task_id = ?",
+                    (remaining, json.dumps(results, ensure_ascii=False), task_id),
+                )
+                # P1-402: Clean up temp directory for this task
+                task_tmp = TMP_DIR / task_id
+                if task_tmp.exists():
+                    shutil.rmtree(task_tmp, ignore_errors=True)
+                    LOGGER.info("Cleaned stale temp dir: %s", task_tmp)
             conn.commit()
-            return cursor.rowcount
+            return len(rows)
         finally:
             conn.close()
 

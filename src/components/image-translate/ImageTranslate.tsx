@@ -76,7 +76,20 @@ export default function ImageTranslate() {
     const arr = Array.from(newFiles).filter((f) =>
       /\.(jpe?g|png|webp|bmp|tiff?)$/i.test(f.name)
     );
-    setFiles((prev) => [...prev, ...arr].slice(0, 50));
+    // Validate file sizes before adding
+    const MAX_FILE = 10 * 1024 * 1024; // 10MB
+    const MAX_TOTAL = 50 * 1024 * 1024; // 50MB
+    const valid = arr.filter((f) => {
+      if (f.size > MAX_FILE) { setError(`文件 ${f.name} 超过 10MB 限制`); return false; }
+      return true;
+    });
+    setFiles((prev) => {
+      const combined = [...prev, ...valid].slice(0, 50);
+      const totalSize = combined.reduce((s, f) => s + f.size, 0);
+      if (totalSize > MAX_TOTAL) { setError("总大小不能超过 50MB，请减少文件"); return prev; }
+      setError("");
+      return combined;
+    });
     setError("");
   };
 
@@ -126,7 +139,7 @@ export default function ImageTranslate() {
         >
           <Upload className="mb-3 text-muted" size={32} />
           <p className="text-sm text-muted">拖拽图片到此处，或点击选择</p>
-          <p className="mt-1 text-xs text-muted/60">支持 JPG / PNG / WebP / BMP / TIFF，单次最多 50 张</p>
+          <p className="mt-1 text-xs text-muted/60">支持 JPG / PNG / WebP / BMP / TIFF，单张≤10MB，总计≤50MB，最多 50 张</p>
           <input ref={fileInputRef} type="file" multiple accept=".jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff" className="hidden" onChange={(e) => e.target.files && handleFiles(e.target.files)} />
         </div>
 
