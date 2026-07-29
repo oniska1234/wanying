@@ -21,6 +21,7 @@ const map: Record<string, ComponentType> = {
   "img-base64": dynamic(() => import("./tools/ImgBase64")),
   "quote-compare": dynamic(() => import("./tools/QuoteCompare")),
   "my-profit": dynamic(() => import("./my-profit/MyProfit")),
+  "image-translate": dynamic(() => import("./image-translate/ImageTranslate")),
 };
 
 export default function ToolRenderer({ slug }: { slug: string }) {

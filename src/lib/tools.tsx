@@ -16,6 +16,7 @@ import {
   Image as ImageIcon,
   FileSearch,
   TrendingUp,
+  Languages,
   type LucideIcon,
 } from "lucide-react";
 
@@ -277,6 +278,17 @@ export const tools: Tool[] = [
     category: "cross-border",
     icon: TrendingUp,
     keywords: ["tiktok", "马来西亚", "利润", "选品", "跨境", "费率", "保本价", "profit"],
+    hot: true,
+    isNew: true,
+  },
+  {
+    slug: "image-translate",
+    name: "图片翻译",
+    en: "Image Translate",
+    desc: "上传商品图片，自动识别中文并翻译为马来文，AI 修复文字区域。",
+    category: "cross-border",
+    icon: Languages,
+    keywords: ["图片翻译", "中文", "马来文", "跨境", "商品图", "OCR"],
     hot: true,
     isNew: true,
   },

@@ -35,3 +35,8 @@ _preview_*.png
 
 # scripts output
 scripts/
+backups/
+services/image-translate/tasks.db
+services/image-translate/tmp/
+services/image-translate/logs/
+services/image-translate/venv/

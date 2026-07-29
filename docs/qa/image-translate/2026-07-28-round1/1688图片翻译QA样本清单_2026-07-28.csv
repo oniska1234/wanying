@@ -1,0 +1,17 @@
+sample_id,category,source_1688_url,download_date,original_filename,width,height,file_size_bytes,image_type,chinese_text_transcript,expected_malay_terms,preserve_brand_model_numbers,allow_brand_removal,quality_focus,status,notes
+IMG-001,简单白底主图,,,,,,,,,,YES,NO,大字OCR与布局,待准备,1-2行大中文
+IMG-002,多卖点主图,,,,,,,,,,YES,NO,多区域OCR与文字重叠,待准备,4-8个卖点标签
+IMG-003,复杂背景主图,,,,,,,,,,YES,NO,背景修复与主体保护,待准备,中文覆盖渐变或纹理
+IMG-004,产品规格表,,,,,,,,,,YES,NO,数字单位与表格对齐,待准备,包含容量尺寸数量
+IMG-005,服装尺码表,,,,,,,,,,YES,NO,表格与中英混排,待准备,包含S/M/L/XL和cm
+IMG-006,中文英文型号混排,,,,,,,,,,YES,NO,只翻中文并保留型号,待准备,包含英文和数字型号
+IMG-007,品牌或水印图,,,,,,,,,,YES,待确认,品牌处理策略,待准备,记录是否允许去除
+IMG-008,无文字商品主图,,,,,,,,,,YES,NO,不得生成虚假文字,待准备,纯商品图
+IMG-009,低清小字图,,,,,,,,,,YES,NO,增强与OCR下限,待准备,短边小于640像素
+IMG-010,深色背景浅色字,,,,,,,,,,YES,NO,反色描边文字识别,待准备,深底白字或描边字
+IMG-011,透明PNG或WebP,,,,,,,,,,YES,NO,透明背景处理,待准备,记录alpha通道
+IMG-012,纵向长详情图,,,,,,,,,,YES,NO,比例与文字可读性,待准备,约750x3000以上
+IMG-013,密集说明图,,,,,,,,,,YES,NO,20行以上OCR召回,待准备,记录人工文字抄录
+IMG-014,多场景拼版图,,,,,,,,,,YES,NO,多区域与主体保护,待准备,4-6个场景
+IMG-015,特殊字符图,,,,,,,,,,YES,NO,单位标点保留,待准备,包含¥℃±×斜杠括号
+IMG-016,中马文混排图,,,,,,,,,,YES,NO,已有马来文不重复翻译,待准备,至少2行已有马来文

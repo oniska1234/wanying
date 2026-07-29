@@ -29,6 +29,7 @@ model User {
   subscriptions Subscription[]
   costTemplates CostTemplate[]
   auditLogs     AuditLog[]
+  imageTranslateTasks ImageTranslateTask[]
 }
 
 enum UserRole {
@@ -268,4 +269,39 @@ model AuditLog {
   createdAt  DateTime @default(now())
 
   user User? @relation(fields: [userId], references: [id])
+}
+
+// ============ Image Translate Tool ============
+
+model ImageTranslateTask {
+  id          String   @id @default(cuid())
+  userId      String
+  status      String   @default("pending") // pending, processing, done, failed
+  totalCount  Int      @default(0)
+  doneCount   Int      @default(0)
+  failedCount Int      @default(0)
+  sourceDir   String   // OSS prefix for inputs
+  outputDir   String   // OSS prefix for outputs
+  report      String?  @db.Text
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user  User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items ImageTranslateItem[]
+
+  @@index([userId, createdAt])
+}
+
+model ImageTranslateItem {
+  id        String  @id @default(cuid())
+  taskId    String
+  fileName  String
+  sourceKey String  // OSS key
+  outputKey String? // OSS key
+  status    String  @default("pending") // pending, processing, success, failed
+  error     String?
+
+  task ImageTranslateTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
 }
