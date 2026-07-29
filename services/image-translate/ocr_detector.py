@@ -20,7 +20,9 @@ LOGGER = logging.getLogger("image_translate.ocr")
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 TRANSLATION_BOX_SCALE = 1.18
-TRANSLATION_FONT_MAX_SIZE = 52
+TRANSLATION_FONT_MAX_SIZE = 72
+# Vertical text: if box height / width > this ratio, treat as vertical
+VERTICAL_RATIO_THRESHOLD = 1.4
 
 
 @dataclass(frozen=True)
@@ -101,12 +103,40 @@ PHRASE_TRANSLATIONS = {
     "可塑性强随意塑形": "MUDAH DIBENTUK",
     "与众不同": "REKA BENTUK UNIK",
     "蛋黄鸭家族化设计": "REKA BENTUK ITIK KUNING COMEL",
+    "秀出好身材": "TONJOLKAN FIGURA MENAWAN",
+    "拉长身材比例": "PANJANGKAN PROPORSI BADAN",
+    "修身显瘦": "LANGSING & ANGGUN",
+    "高腰收腹": "PINGGANG TINGGI RATAKAN PERUT",
+    "提臀塑形": "ANGKAT PUNGGUNG BENTUK BADAN",
+    "弹力面料": "FABRIK ANJAL",
+    "透气网纱": "JARING BERNAFAS",
+    "舒适贴合": "SELESA & MELEKAT",
 }
 
 NORMALIZED_TRANSLATIONS = {
     normalize_text(source): translation
     for source, translation in PHRASE_TRANSLATIONS.items()
 }
+
+
+def _is_vertical_text(box: tuple[int, int, int, int], text: str) -> bool:
+    """Detect if the text region is vertical layout."""
+    x1, y1, x2, y2 = box
+    w = x2 - x1
+    h = y2 - y1
+    if w <= 0 or h <= 0:
+        return False
+    ratio = h / w
+    # Vertical if height >> width, or if char count matches vertical stacking
+    if ratio >= VERTICAL_RATIO_THRESHOLD:
+        return True
+    # Also check: if number of CJK chars * estimated char width ~ height
+    cjk_count = len(CJK_RE.findall(text))
+    if cjk_count >= 3 and h > w * 1.2:
+        char_h = h / cjk_count
+        if abs(char_h - w) < w * 0.5:  # each char is roughly square
+            return True
+    return False
 
 
 def draw_text_box(
@@ -123,12 +153,16 @@ def draw_text_box(
     pad: int = 4,
     stroke_width: int = 0,
     stroke_fill: tuple[int, int, int] | None = None,
+    vertical: bool = False,
 ) -> None:
-    """Draw text within a bounding box, auto-fitting font size."""
+    """Draw text within a bounding box, auto-fitting font size.
+    
+    If vertical=True, renders text as one word per line (stacked vertically)
+    to match vertical Chinese layout.
+    """
     if not text:
         if bg is not None:
             draw = ImageDraw.Draw(im)
-            x1, y1, x2, y2 = box
             if radius > 0:
                 draw.rounded_rectangle(box, radius=radius, fill=bg)
             else:
@@ -146,7 +180,13 @@ def draw_text_box(
         else:
             draw.rectangle(box, fill=bg)
 
-    # Binary search for font size
+    if vertical:
+        _draw_vertical_text(draw, im, box, text, fill=fill, max_size=max_size,
+                           min_size=min_size, pad=pad, stroke_width=stroke_width,
+                           stroke_fill=stroke_fill)
+        return
+
+    # Horizontal text: binary search for font size
     lo, hi = min_size, max_size
     best_size = min_size
     while lo <= hi:
@@ -184,6 +224,94 @@ def draw_text_box(
         kwargs["stroke_width"] = stroke_width
         kwargs["stroke_fill"] = stroke_fill
     draw.multiline_text((tx, ty), text, **kwargs)
+
+
+def _draw_vertical_text(
+    draw: ImageDraw.ImageDraw,
+    im: Image.Image,
+    box: tuple[int, int, int, int],
+    text: str,
+    *,
+    fill: tuple[int, int, int],
+    max_size: int,
+    min_size: int,
+    pad: int,
+    stroke_width: int = 0,
+    stroke_fill: tuple[int, int, int] | None = None,
+) -> None:
+    """Render text vertically: one word per line, centered in box.
+    
+    For Malay/Latin text in a vertical Chinese layout, we stack words
+    vertically with each word on its own line, using a font size that
+    matches the original character size.
+    """
+    x1, y1, x2, y2 = box
+    box_w = max(1, x2 - x1 - pad * 2)
+    box_h = max(1, y2 - y1 - pad * 2)
+
+    # Split text into words for vertical stacking
+    words = text.split()
+    if not words:
+        return
+
+    # Binary search for font size that fits all words stacked vertically
+    lo, hi = min_size, max_size
+    best_size = min_size
+    line_spacing_ratio = 0.25  # extra spacing between lines as fraction of font size
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        try:
+            fnt = ImageFont.truetype(str(FONT_BOLD), size=mid)
+        except OSError:
+            fnt = ImageFont.load_default()
+        # Check: widest word must fit in box_w, total height must fit in box_h
+        max_word_w = 0
+        total_h = 0
+        for i, word in enumerate(words):
+            wbbox = draw.textbbox((0, 0), word, font=fnt)
+            ww = wbbox[2] - wbbox[0]
+            wh = wbbox[3] - wbbox[1]
+            max_word_w = max(max_word_w, ww)
+            total_h += wh
+            if i < len(words) - 1:
+                total_h += int(mid * line_spacing_ratio)
+        if max_word_w <= box_w and total_h <= box_h:
+            best_size = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    try:
+        fnt = ImageFont.truetype(str(FONT_BOLD), size=best_size)
+    except OSError:
+        fnt = ImageFont.load_default()
+
+    # Calculate total height for centering
+    line_heights = []
+    line_widths = []
+    for word in words:
+        wbbox = draw.textbbox((0, 0), word, font=fnt)
+        line_widths.append(wbbox[2] - wbbox[0])
+        line_heights.append(wbbox[3] - wbbox[1])
+    spacing = int(best_size * line_spacing_ratio)
+    total_h = sum(line_heights) + spacing * (len(words) - 1)
+
+    # Start Y: vertically centered
+    cy = y1 + pad + (box_h - total_h) // 2
+    cx = x1 + pad + box_w // 2
+
+    kwargs: dict = {"font": fnt, "fill": fill}
+    if stroke_width > 0 and stroke_fill:
+        kwargs["stroke_width"] = stroke_width
+        kwargs["stroke_fill"] = stroke_fill
+
+    for i, word in enumerate(words):
+        ww = line_widths[i]
+        # Horizontally center each word
+        wx = cx - ww // 2
+        draw.text((wx, cy), word, **kwargs)
+        cy += line_heights[i] + spacing
 
 
 class ResidualChineseDetector:
@@ -349,29 +477,58 @@ class ResidualChineseDetector:
         for hit, translation in replacements:
             if not translation:
                 continue
-            box = self._expand_box(hit.box, image.size)
+
+            box_w = hit.box[2] - hit.box[0]
+            box_h = hit.box[3] - hit.box[1]
+            is_vertical = _is_vertical_text(hit.box, hit.text)
+
             bg = self._sample_background(image, hit.box)
             bg_lum = self._luminance(bg)
 
             # Use sampled original text color if it has good contrast, else auto
             orig_color = text_colors.get(hit.box)
-            if orig_color and abs(self._luminance(orig_color) - bg_lum) > 80:
+            if orig_color and abs(self._luminance(orig_color) - bg_lum) > 60:
                 fg = orig_color
             elif bg_lum >= 145:
                 fg = (30, 30, 30)  # Dark text on light bg
             else:
                 fg = (255, 255, 255)  # White text on dark bg
 
-            # Stroke for readability
-            stroke_fill = (255, 255, 255) if bg_lum >= 145 else (0, 0, 0)
-            stroke_w = 1 if self._luminance(fg) - bg_lum < 100 else 0
+            # NO stroke by default - only add if contrast is truly poor (< 50 luminance diff)
+            contrast = abs(self._luminance(fg) - bg_lum)
+            if contrast < 50:
+                stroke_fill = (255, 255, 255) if bg_lum >= 145 else (0, 0, 0)
+                stroke_w = 1
+            else:
+                stroke_w = 0
+                stroke_fill = None
 
-            height = hit.box[3] - hit.box[1]
-            max_size = max(10, min(TRANSLATION_FONT_MAX_SIZE, int(height * 0.82)))
-            draw_text_box(
-                image, box, translation, fill=fg, max_size=max_size,
-                min_size=8, pad=4, stroke_width=stroke_w, stroke_fill=stroke_fill,
-            )
+            if is_vertical:
+                # For vertical text: use per-character size from original
+                cjk_count = max(1, len(CJK_RE.findall(hit.text)))
+                char_size = box_h // cjk_count
+                # Font size should match original character size (with some scaling)
+                max_size = max(14, min(TRANSLATION_FONT_MAX_SIZE, int(char_size * 0.95)))
+                # Expand box: keep same height, widen to fit horizontal words
+                # Use 3x original width or at least enough for the longest word
+                expanded_w = max(box_w * 3, int(box_h * 0.4))
+                cx = (hit.box[0] + hit.box[2]) // 2
+                left = max(0, cx - expanded_w // 2)
+                right = min(image.size[0], left + expanded_w)
+                expanded_box = (left, hit.box[1], right, hit.box[3])
+                draw_text_box(
+                    image, expanded_box, translation, fill=fg, max_size=max_size,
+                    min_size=10, pad=2, stroke_width=stroke_w, stroke_fill=stroke_fill,
+                    vertical=True,
+                )
+            else:
+                # Horizontal text: use box height for font sizing
+                max_size = max(10, min(TRANSLATION_FONT_MAX_SIZE, int(box_h * 0.82)))
+                expanded_box = self._expand_box(hit.box, image.size)
+                draw_text_box(
+                    image, expanded_box, translation, fill=fg, max_size=max_size,
+                    min_size=8, pad=4, stroke_width=stroke_w, stroke_fill=stroke_fill,
+                )
 
     @staticmethod
     def _sample_text_color(image: Image.Image, box: tuple[int, int, int, int]) -> tuple[int, int, int] | None:
@@ -382,7 +539,6 @@ class ResidualChineseDetector:
         x2, y2 = min(w, x2), min(h, y2)
         if x2 <= x1 or y2 <= y1:
             return None
-        import numpy as np
         region = np.asarray(image.crop((x1, y1, x2, y2)).convert("RGB"))
         if region.size == 0:
             return None
