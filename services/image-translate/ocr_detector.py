@@ -285,6 +285,7 @@ def render_text_with_layout(
     2. Rotating to match original angle
     3. Compositing onto the image at the correct position
     """
+    LOGGER.debug('render_text_with_layout: box=%s angle=%.1f font_size=%d color=%s bold=%s text=%s', box, layout.angle, layout.font_size, layout.color, layout.is_bold, text[:30])
     if not text:
         return
 
@@ -694,16 +695,32 @@ class ResidualChineseDetector:
 
         hits_to_inpaint = []
         render_tasks = []
+        LOGGER.debug('Vision data raw: %s', vision_data)
+        img_w, img_h = edited.size
+
+        # Qwen-VL returns coordinates in 0-1000 normalized space.
+        # Scale to actual pixel coordinates.
+        def _scale_coord(val, dim):
+            """Scale a coordinate from 0-1000 space to actual pixels."""
+            return int(val * dim / 1000.0)
 
         for item in vision_data:
             try:
                 box = item.get("box", [])
                 if len(box) != 4:
                     continue
-                x1, y1, x2, y2 = [int(v) for v in box]
-                w, h = edited.size
+                # Scale from 0-1000 normalized to actual pixels
+                raw_coords = [int(v) for v in box]
+                # Detect if coords are normalized (all <= 1000) vs pixel coords
+                if all(c <= 1000 for c in raw_coords) and (raw_coords[2] <= 1000 or raw_coords[3] <= 1000):
+                    x1 = _scale_coord(raw_coords[0], img_w)
+                    y1 = _scale_coord(raw_coords[1], img_h)
+                    x2 = _scale_coord(raw_coords[2], img_w)
+                    y2 = _scale_coord(raw_coords[3], img_h)
+                else:
+                    x1, y1, x2, y2 = raw_coords
                 x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w, x2), min(h, y2)
+                x2, y2 = min(img_w, x2), min(img_h, y2)
                 if x2 <= x1 or y2 <= y1:
                     continue
 
@@ -728,6 +745,10 @@ class ResidualChineseDetector:
                 font_size = item.get("font_size", 20)
                 if not isinstance(font_size, (int, float)) or font_size < 8:
                     font_size = 20
+                # Scale font_size from 0-1000 space to pixels
+                if font_size <= 100:
+                    font_size = _scale_coord(font_size, img_h)
+                font_size = max(12, min(200, font_size))
 
                 # Determine angle from orientation
                 if orientation == "vertical":

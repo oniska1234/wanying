@@ -109,10 +109,22 @@ class ImagePipeline:
                     edited, vision_data
                 )
 
-            # Fallback: RapidOCR pass for any remaining Chinese text
-            source_residual = self.detector.repair_and_verify(
-                edited, allow_repair=True, translator=self.translator,
-            )
+            # Fallback: RapidOCR pass only if vision didn't handle all text
+            if vision_repaired > 0:
+                # Vision handled text - only do a scan to check residuals (no repair)
+                remaining_hits = self.detector.scan(edited)
+                if not remaining_hits:
+                    # All text handled by vision, skip RapidOCR repair
+                    from ocr_detector import ResidualResult
+                    source_residual = ResidualResult(image=edited, detected=(), repaired=(), remaining=())
+                else:
+                    source_residual = self.detector.repair_and_verify(
+                        edited, allow_repair=True, translator=self.translator,
+                    )
+            else:
+                source_residual = self.detector.repair_and_verify(
+                    edited, allow_repair=True, translator=self.translator,
+                )
 
             # Enhancement (only upscale small images, preserve aspect)
             enhancement = self.enhancer.enhance(source_residual.image)
