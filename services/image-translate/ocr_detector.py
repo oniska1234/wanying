@@ -695,30 +695,17 @@ class ResidualChineseDetector:
 
         hits_to_inpaint = []
         render_tasks = []
-        LOGGER.debug('Vision data raw: %s', vision_data)
+        LOGGER.info('Vision data raw: %s', vision_data)
         img_w, img_h = edited.size
-
-        # Qwen-VL returns coordinates in 0-1000 normalized space.
-        # Scale to actual pixel coordinates.
-        def _scale_coord(val, dim):
-            """Scale a coordinate from 0-1000 space to actual pixels."""
-            return int(val * dim / 1000.0)
 
         for item in vision_data:
             try:
                 box = item.get("box", [])
                 if len(box) != 4:
                     continue
-                # Scale from 0-1000 normalized to actual pixels
+                # Qwen-VL returns pixel coordinates directly
                 raw_coords = [int(v) for v in box]
-                # Detect if coords are normalized (all <= 1000) vs pixel coords
-                if all(c <= 1000 for c in raw_coords) and (raw_coords[2] <= 1000 or raw_coords[3] <= 1000):
-                    x1 = _scale_coord(raw_coords[0], img_w)
-                    y1 = _scale_coord(raw_coords[1], img_h)
-                    x2 = _scale_coord(raw_coords[2], img_w)
-                    y2 = _scale_coord(raw_coords[3], img_h)
-                else:
-                    x1, y1, x2, y2 = raw_coords
+                x1, y1, x2, y2 = raw_coords
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(img_w, x2), min(img_h, y2)
                 if x2 <= x1 or y2 <= y1:
@@ -742,13 +729,16 @@ class ResidualChineseDetector:
                 else:
                     fg = _sample_text_color_from_image(edited, (x1, y1, x2, y2)) or (30, 30, 30)
 
-                font_size = item.get("font_size", 20)
-                if not isinstance(font_size, (int, float)) or font_size < 8:
-                    font_size = 20
-                # Scale font_size from 0-1000 space to pixels
-                if font_size <= 100:
-                    font_size = _scale_coord(font_size, img_h)
-                font_size = max(12, min(200, font_size))
+                # Derive font_size from box dimensions (more reliable than Qwen-VL's value)
+                box_w_px = x2 - x1
+                box_h_px = y2 - y1
+                if orientation == "vertical":
+                    # For vertical text: font_size = column width (each char fills the width)
+                    font_size = int(box_w_px * 0.85)
+                else:
+                    # For horizontal text: font_size = box height * 0.8
+                    font_size = int(box_h_px * 0.8)
+                font_size = max(14, min(200, font_size))
 
                 # Determine angle from orientation
                 if orientation == "vertical":
@@ -773,7 +763,9 @@ class ResidualChineseDetector:
                     box=(x1, y1, x2, y2),
                     polygon=((x1, y1), (x2, y1), (x2, y2), (x1, y2)),
                 ))
-                render_tasks.append((box, translation, layout))
+                LOGGER.info('Vision render: box=(%d,%d,%d,%d) orient=%s font=%d color=%s text=%s',
+                           x1, y1, x2, y2, orientation, font_size, fg, translation[:20])
+                render_tasks.append(((x1, y1, x2, y2), translation, layout))
             except (ValueError, TypeError, KeyError) as e:
                 LOGGER.warning("Vision item parse error: %s", e)
                 continue
@@ -784,7 +776,7 @@ class ResidualChineseDetector:
 
         # Render with layout
         for box, translation, layout in render_tasks:
-            render_text_with_layout(edited, tuple(box), translation, layout)
+            render_text_with_layout(edited, box, translation, layout)
             count += 1
 
         LOGGER.info("Vision replacements applied: %d regions", count)
@@ -795,7 +787,7 @@ class ResidualChineseDetector:
         h, w = pixels.shape[:2]
         for hit in hits:
             x1, y1, x2, y2 = hit.box
-            pad = max(3, min(10, round((y2 - y1) * 0.15)))
+            pad = max(5, min(30, round(max(y2 - y1, x2 - x1) * 0.2)))
             left = max(0, x1 - pad)
             top = max(0, y1 - pad)
             right = min(w, x2 + pad)
