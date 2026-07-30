@@ -109,18 +109,10 @@ class ImagePipeline:
                     edited, vision_data
                 )
 
-            # Fallback: RapidOCR pass only if vision didn't handle all text
+            # When vision succeeds, trust it completely - skip RapidOCR
             if vision_repaired > 0:
-                # Vision handled text - only do a scan to check residuals (no repair)
-                remaining_hits = self.detector.scan(edited)
-                if not remaining_hits:
-                    # All text handled by vision, skip RapidOCR repair
-                    from ocr_detector import ResidualResult
-                    source_residual = ResidualResult(image=edited, detected=(), repaired=(), remaining=())
-                else:
-                    source_residual = self.detector.repair_and_verify(
-                        edited, allow_repair=True, translator=self.translator,
-                    )
+                from ocr_detector import ResidualResult
+                source_residual = ResidualResult(image=edited, detected=(), repaired=(), remaining=())
             else:
                 source_residual = self.detector.repair_and_verify(
                     edited, allow_repair=True, translator=self.translator,
@@ -132,12 +124,16 @@ class ImagePipeline:
             # Limit output size (preserve aspect ratio, no forced square)
             final = limit_size(enhancement.image)
 
-            # Second pass after resize (may reveal new text)
-            final_residual = self.detector.repair_and_verify(
-                final, allow_repair=True, translator=self.translator,
-            )
-            final_brand = self.detector.remove_brands_and_verify(final_residual.image)
-            final = final_brand.image
+            # Second pass after resize - skip if vision already handled text
+            if vision_repaired > 0:
+                final_brand = self.detector.remove_brands_and_verify(final)
+                final = final_brand.image
+            else:
+                final_residual = self.detector.repair_and_verify(
+                    final, allow_repair=True, translator=self.translator,
+                )
+                final_brand = self.detector.remove_brands_and_verify(final_residual.image)
+                final = final_brand.image
 
             repaired_count = vision_repaired + len(source_residual.repaired) + len(final_residual.repaired)
             removed_brand_count = len(source_brand.repaired) + len(final_brand.repaired)

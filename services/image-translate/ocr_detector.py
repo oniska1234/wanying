@@ -373,67 +373,93 @@ def _render_rotated(
 ) -> None:
     """Render text at an angle by drawing on transparent canvas and rotating.
 
-    The text is first rendered horizontally, then rotated to match the
-    original text angle, then composited onto the image centered in the box.
+    For vertical text (angle ~90): renders text as multiple lines if needed,
+    then rotates the entire block. Font size is based on column width,
+    NOT shrunk to fit text length.
     """
     x1, y1, x2, y2 = box
     box_w = x2 - x1
     box_h = y2 - y1
 
-    # For rotated text, the available space after rotation:
-    # If angle ~90 (vertical): horizontal text width must fit in box_h,
-    #                          horizontal text height must fit in box_w
-    # General formula using rotation matrix bounds:
-    rad = math.radians(abs(angle))
-    cos_a = abs(math.cos(rad))
-    sin_a = abs(math.sin(rad))
-    # Available width for horizontal text = box_w * cos + box_h * sin (approx)
-    # Available height for horizontal text = box_w * sin + box_h * cos (approx)
-    # But simpler: for ~90 deg, swap w and h
     abs_angle = abs(angle) % 180
     if abs_angle > 45:
-        # Mostly vertical: text length fits in box_h, text height fits in box_w
-        avail_w = box_h
-        avail_h = box_w
+        # Mostly vertical: after rotation, text height maps to box_w,
+        # text width maps to box_h
+        avail_w = box_h  # max horizontal text width (becomes height after rotation)
+        avail_h = box_w  # max horizontal text height (becomes width after rotation)
     else:
         avail_w = box_w
         avail_h = box_h
 
-    # Auto-fit font size for the rotated case
-    draw_temp = ImageDraw.Draw(image)
+    # For vertical text: use initial_size (derived from column width) as the font size.
+    # Only shrink if text height (line height) exceeds column width.
+    # DO NOT shrink based on text length - instead use multi-line wrapping.
     size = initial_size
-    while size > 8:
-        try:
-            fnt = ImageFont.truetype(str(FONT_BOLD), size=size)
-        except OSError:
-            break
-        bbox = draw_temp.textbbox((0, 0), text, font=fnt)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        if tw <= avail_w - 4 and th <= avail_h - 4:
-            break
-        size -= 2
-
+    # Ensure single line height fits in avail_h (column width after rotation)
     try:
         fnt = ImageFont.truetype(str(FONT_BOLD), size=size)
     except OSError:
         fnt = ImageFont.load_default()
+    draw_temp = ImageDraw.Draw(image)
+    test_bbox = draw_temp.textbbox((0, 0), "Ay", font=fnt)
+    line_h = test_bbox[3] - test_bbox[1]
+    while line_h > avail_h - 4 and size > 12:
+        size -= 2
+        try:
+            fnt = ImageFont.truetype(str(FONT_BOLD), size=size)
+        except OSError:
+            break
+        test_bbox = draw_temp.textbbox((0, 0), "Ay", font=fnt)
+        line_h = test_bbox[3] - test_bbox[1]
 
-    # Render text on transparent canvas
-    bbox = draw_temp.textbbox((0, 0), text, font=fnt)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
+    # Word-wrap text into multiple lines that each fit in avail_w
+    words = text.split()
+    lines = []
+    current_line = ""
+    for word in words:
+        test = (current_line + " " + word).strip()
+        bbox = draw_temp.textbbox((0, 0), test, font=fnt)
+        tw = bbox[2] - bbox[0]
+        if tw <= avail_w - 4:
+            current_line = test
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+    if current_line:
+        lines.append(current_line)
+    if not lines:
+        lines = [text]
+
+    # Render multi-line text on transparent canvas
+    line_spacing = max(2, size // 8)
+    # Measure total size
+    line_widths = []
+    line_heights = []
+    for line in lines:
+        bbox = draw_temp.textbbox((0, 0), line, font=fnt)
+        line_widths.append(bbox[2] - bbox[0])
+        line_heights.append(bbox[3] - bbox[1])
+    total_w = max(line_widths) if line_widths else avail_w
+    total_h = sum(line_heights) + line_spacing * (len(lines) - 1) if line_heights else avail_h
+
     padding = 4
-    txt_img = Image.new("RGBA", (tw + padding * 2, th + padding * 2), (0, 0, 0, 0))
+    txt_img = Image.new("RGBA", (total_w + padding * 2, total_h + padding * 2), (0, 0, 0, 0))
     txt_draw = ImageDraw.Draw(txt_img)
-    txt_draw.text(
-        (padding - bbox[0], padding - bbox[1]),
-        text, font=fnt, fill=color + (255,),
-    )
+
+    y_offset = padding
+    for i, line in enumerate(lines):
+        bbox = draw_temp.textbbox((0, 0), line, font=fnt)
+        lw = bbox[2] - bbox[0]
+        # Center each line horizontally
+        lx = padding + (total_w - lw) // 2
+        txt_draw.text(
+            (lx - bbox[0], y_offset - bbox[1]),
+            line, font=fnt, fill=color + (255,),
+        )
+        y_offset += line_heights[i] + line_spacing
 
     # Rotate: PIL rotates counter-clockwise, so negate the angle
-    # For Chinese vertical text (angle ~90), we want the text to read top-to-bottom
-    # which means rotating -90 (clockwise 90)
     rotated = txt_img.rotate(-angle, expand=True, resample=Image.Resampling.BICUBIC)
 
     # Paste centered in box
@@ -444,14 +470,16 @@ def _render_rotated(
     # Ensure we don't paste outside image
     img_w, img_h = image.size
     if paste_x < 0 or paste_y < 0 or paste_x + rw > img_w or paste_y + rh > img_h:
-        # Clip
         crop_x = max(0, -paste_x)
         crop_y = max(0, -paste_y)
         crop_w = min(rw - crop_x, img_w - max(0, paste_x))
         crop_h = min(rh - crop_y, img_h - max(0, paste_y))
-        rotated = rotated.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
-        paste_x = max(0, paste_x)
-        paste_y = max(0, paste_y)
+        if crop_w > 0 and crop_h > 0:
+            rotated = rotated.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
+            paste_x = max(0, paste_x)
+            paste_y = max(0, paste_y)
+        else:
+            return  # Nothing to paste
 
     image.paste(rotated, (paste_x, paste_y), rotated)
 
@@ -787,7 +815,8 @@ class ResidualChineseDetector:
         h, w = pixels.shape[:2]
         for hit in hits:
             x1, y1, x2, y2 = hit.box
-            pad = max(5, min(30, round(max(y2 - y1, x2 - x1) * 0.2)))
+            # Use generous padding to cover anti-aliased edges
+            pad = max(8, min(50, round(max(y2 - y1, x2 - x1) * 0.25)))
             left = max(0, x1 - pad)
             top = max(0, y1 - pad)
             right = min(w, x2 + pad)
@@ -795,14 +824,11 @@ class ResidualChineseDetector:
             if right <= left or bottom <= top:
                 continue
             roi = pixels[top:bottom, left:right]
-            mask = np.zeros(roi.shape[:2], dtype=np.uint8)
-            pts = np.array(hit.polygon, dtype=np.int32)
-            pts[:, 0] -= left
-            pts[:, 1] -= top
-            cv2.fillPoly(mask, [pts], 255)
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            mask = cv2.dilate(mask, kernel, iterations=3)
-            inpainted = cv2.inpaint(roi, mask, 5, cv2.INPAINT_NS)
+            # Use FULL padded rectangle as mask (not just polygon)
+            # This ensures all text pixels including anti-aliasing are covered
+            mask = np.ones(roi.shape[:2], dtype=np.uint8) * 255
+            # Use larger inpaint radius for better fill
+            inpainted = cv2.inpaint(roi, mask, 10, cv2.INPAINT_TELEA)
             pixels[top:bottom, left:right] = inpainted
         image.paste(Image.fromarray(pixels, mode="RGB"))
 
