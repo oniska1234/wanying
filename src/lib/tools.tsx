@@ -292,6 +292,17 @@ export const tools: Tool[] = [
     hot: true,
     isNew: true,
   },
+  {
+    slug: "image-translate-high-concurrency",
+    name: "图片翻译高并发版",
+    en: "Image Translate High-Concurrency",
+    desc: "面向批量商品图的持久化队列翻译，自动识别中文并翻译为马来文，统一输出 800×800。",
+    category: "cross-border",
+    icon: Languages,
+    keywords: ["图片翻译", "高并发", "批量", "中文", "马来文", "跨境", "商品图", "OCR", "800x800"],
+    hot: true,
+    isNew: true,
+  },
 ];
 
 export function getTool(slug: string): Tool | undefined {

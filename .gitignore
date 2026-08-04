@@ -41,4 +41,10 @@ services/image-translate/tmp/
 services/image-translate/logs/
 services/image-translate/venv/
 services/image-translate/__pycache__/
+services/image-translate/tests/__pycache__/
+services/image-translate-high-concurrency/tasks.db*
+services/image-translate-high-concurrency/tmp/
+services/image-translate-high-concurrency/logs/
+services/image-translate-high-concurrency/__pycache__/
+services/image-translate-high-concurrency/tests/__pycache__/
 docs/qa/

@@ -11,8 +11,13 @@ from PIL import Image
 
 from config import MAX_OUTPUT_EDGE, OUTPUT_WIDTH, OUTPUT_HEIGHT, JPEG_QUALITY
 from translator import MalayTranslator
-from ocr_detector import ResidualChineseDetector, box_overlap_ratio
+from ocr_detector import (
+    ResidualChineseDetector,
+    box_overlap_ratio,
+    is_actionable_chinese_hit,
+)
 from enhancement import ImageQualityEnhancer
+from quality_gate import assess_layout_diagnostics
 
 LOGGER = logging.getLogger("image_translate.pipeline")
 
@@ -87,16 +92,15 @@ def fit_to_output_canvas(
         (max(1, round(img.width * scale)), max(1, round(img.height * scale))),
         Image.Resampling.LANCZOS,
     )
+    # Use the average of the four corners so poster backgrounds remain visually
+    # continuous while the product and translated copy keep their proportions.
     corners = (
         resized.getpixel((0, 0)),
         resized.getpixel((resized.width - 1, 0)),
         resized.getpixel((0, resized.height - 1)),
         resized.getpixel((resized.width - 1, resized.height - 1)),
     )
-    background = tuple(
-        round(sum(pixel[channel] for pixel in corners) / 4)
-        for channel in range(3)
-    )
+    background = tuple(round(sum(pixel[channel] for pixel in corners) / 4) for channel in range(3))
     canvas = Image.new("RGB", size, background)
     canvas.paste(resized, ((target_w - resized.width) // 2, (target_h - resized.height) // 2))
     return canvas
@@ -130,21 +134,63 @@ class ImagePipeline:
             with Image.open(source_path) as opened:
                 edited = opened.copy().convert("RGB")
 
-            # Brand removal
-            source_brand = self.detector.remove_brands_and_verify(edited)
-            edited = source_brand.image
-
-            # Trim white borders
-            edited = trim_near_white_border(edited)
-
             # Try Qwen-VL vision analysis first for layout-aware translation
-            vision_data = self.translator.vision_analyze_image(source_path)
+            self.detector.last_layout_diagnostics = []
+            self.detector.last_brand_boxes = []
+            self.detector.last_watermark_diagnostics = []
+            self.detector.last_remaining_hits = []
+            source_ocr_hints = self.detector.scan(edited, minimum_confidence=0.35)
+            vision_data = self.translator.vision_analyze_image(
+                source_path,
+                ocr_hints=[
+                    {"text": hit.text, "box": list(hit.box)}
+                    for hit in source_ocr_hints
+                ],
+            )
             vision_repaired = 0
             handled_boxes: tuple[tuple[int, int, int, int], ...] = ()
             if vision_data:
                 edited, vision_repaired, handled_boxes = self.detector.apply_vision_replacements(
                     edited, vision_data, self.translator,
                 )
+            unsafe_watermarks = [
+                item for item in self.detector.last_watermark_diagnostics
+                if item.get("unsafe")
+            ]
+            if unsafe_watermarks:
+                LOGGER.warning(
+                    "Quality gate rejected %s: watermark crosses foreground",
+                    source_path.name,
+                )
+                return {
+                    "status": "failed",
+                    "retryable": False,
+                    "error": "商家水印覆盖商品主体，为避免损伤商品图已停止自动处理，请人工处理",
+                    "quality_score": 0.0,
+                    "quality_reasons": ["watermark_crosses_foreground"],
+                }
+
+            # Fallback brand removal runs after vision so faint OCR fragments
+            # remain available as coordinate anchors for complete watermarks.
+            source_brand = self.detector.remove_brands_and_verify(edited)
+            edited = source_brand.image
+            layout_quality = assess_layout_diagnostics(
+                self.detector.last_layout_diagnostics,
+                image_size=edited.size,
+            )
+            if layout_quality.severe:
+                LOGGER.warning(
+                    "Quality gate rejected %s: unsafe layout (%s)",
+                    source_path.name,
+                    ",".join(layout_quality.reasons),
+                )
+                return {
+                    "status": "failed",
+                    "retryable": False,
+                    "error": "自动排版可能遮挡商品，请人工确认",
+                    "quality_score": layout_quality.score,
+                    "quality_reasons": list(layout_quality.reasons),
+                }
 
             # OCR may still see remnants inside a vision-handled box. Erase
             # those strokes, but never draw a second translation there.
@@ -201,12 +247,24 @@ class ImagePipeline:
                 handled_boxes=scaled_handled_boxes,
             )
             final_brand = self.detector.remove_brands_and_verify(final_residual.image)
-            final = final_brand.image
+            final = trim_near_white_border(final_brand.image)
 
             # A generated JPEG is not a successful translation if unhandled
             # Chinese remains after both repair passes.
-            remaining_chinese = self.detector.scan(final)
+            remaining_chinese = tuple(
+                hit
+                for hit in self.detector.scan(final, minimum_confidence=0.35)
+                if is_actionable_chinese_hit(hit)
+            )
             if remaining_chinese:
+                self.detector.last_remaining_hits = [
+                    {
+                        "text": hit.text,
+                        "confidence": round(hit.confidence, 4),
+                        "box": list(hit.box),
+                    }
+                    for hit in remaining_chinese
+                ]
                 LOGGER.warning(
                     "Quality gate rejected %s: %d Chinese regions remain",
                     source_path.name,
@@ -214,13 +272,17 @@ class ImagePipeline:
                 )
                 return {
                     "status": "failed",
+                    "retryable": False,
                     "error": "译图仍存在未处理中文，请重试或人工确认",
+                    "quality_score": 0.0,
+                    "quality_reasons": ["residual_chinese"],
                 }
 
             repaired_count = vision_repaired + len(source_residual.repaired) + len(final_residual.repaired)
             removed_brand_count = len(source_brand.repaired) + len(final_brand.repaired)
 
-            # Standardize only the final artifact so OCR and layout behavior stay unchanged.
+            # Standardize the public artifact only after all OCR/layout quality
+            # checks. This preserves content proportions and guarantees 800x800.
             final = fit_to_output_canvas(final)
 
             # Save output
@@ -233,10 +295,17 @@ class ImagePipeline:
                 "repaired_phrases": repaired_count,
                 "removed_brands": removed_brand_count,
                 "enhanced": enhancement.enhanced,
+                "quality_score": layout_quality.score,
+                "needs_review": layout_quality.needs_review,
+                "quality_reasons": list(layout_quality.reasons),
             }
         except Exception as exc:
             LOGGER.exception("Failed to process %s", source_path)
-            return {"status": "failed", "error": "图片处理失败，请检查文件格式"}
+            return {
+                "status": "failed",
+                "retryable": False,
+                "error": "图片处理失败，请检查文件格式",
+            }
 
     def process_batch(
         self, input_paths: list[Path], output_dir: Path, progress_callback=None,

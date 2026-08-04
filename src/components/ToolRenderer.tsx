@@ -22,6 +22,7 @@ const map: Record<string, ComponentType> = {
   "quote-compare": dynamic(() => import("./tools/QuoteCompare")),
   "my-profit": dynamic(() => import("./my-profit/MyProfit")),
   "image-translate": dynamic(() => import("./image-translate/ImageTranslate")),
+  "image-translate-high-concurrency": dynamic(() => import("./image-translate/ImageTranslateHighConcurrency")),
 };
 
 export default function ToolRenderer({ slug }: { slug: string }) {

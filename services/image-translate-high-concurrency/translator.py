@@ -77,6 +77,21 @@ ECOMMERCE_PHRASES = {
     "重量": "BERAT",
     "拉长身材比例": "Memanjangkan perkadaran tubuh",
     "秀出好身材": "Tonjolkan bentuk badan cantik",
+    "现货批发": "Borong stok sedia ada",
+    "黄油条捏捏乐": "Mainan picit berbentuk mentega",
+    "凡士林小黄油捏捏乐": "Mainan picit mentega mini berisi vaselin",
+    "可定型不回弹": "Boleh dibentuk dan kekal bentuk",
+    "软糯质感": "Tekstur lembut dan kenyal",
+    "解压捏捏乐": "Mainan picit pelepas stres",
+    "解压发泄玩具": "Mainan pelepas stres",
+    "儿童礼物": "Hadiah kanak-kanak",
+    "12pcs整盒陈列": "Kotak paparan 12 unit",
+    "12ps整盒陈列": "Kotak paparan 12 unit",
+    "统一箱规": "Saiz kotak standard",
+    "单品参数": "Spesifikasi item",
+    "凡士林填充物": "Isian vaselin",
+    "手表": "Jam tangan",
+    "工厂": "Kilang",
 }
 NORMALIZED_ECOMMERCE_PHRASES = {
     _normalize_source_phrase(s): t for s, t in ECOMMERCE_PHRASES.items()
@@ -354,9 +369,16 @@ class MalayTranslator:
             return direct
 
         polished = polish_malaysia_ecommerce(str(candidate or ""), source_text=source)
-        if polished and not malay_quality_issues(polished, source_text=source):
-            self.cache[source] = polished
-            return polished
+        if polished:
+            issues = set(malay_quality_issues(polished, source_text=source))
+            # Vision paragraphs can occupy a large multi-line poster cell. Do
+            # not discard a sound, complete translation merely because it is
+            # longer than a headline; the layout renderer will wrap and fit it.
+            if len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", source)) >= 20 and len(polished) <= 320:
+                issues.difference_update({"too_many_words", "too_long_for_image"})
+            if not issues:
+                self.cache[source] = polished
+                return polished
         return self.translate(source)
 
     def translate_batch(self, texts: list[str]) -> dict[str, str]:
@@ -407,7 +429,9 @@ class MalayTranslator:
         return results
 
 
-    def vision_analyze_image(self, image_path: Path) -> list | None:
+    def vision_analyze_image(
+        self, image_path: Path, *, ocr_hints: list[dict] | None = None,
+    ) -> list | None:
         """Send image to Qwen-VL for layout-aware text analysis and translation.
 
         Returns list of dicts with keys:
@@ -434,22 +458,37 @@ class MalayTranslator:
             else:
                 mime = "image/jpeg"
 
+            hint_text = ""
+            if ocr_hints:
+                hint_text = (
+                    "\nA local OCR pass found these possible Chinese fragments. "
+                    "Use them as clues, verify them visually, and expand partial "
+                    "fragments to the complete visible text region:\n"
+                    + json.dumps(ocr_hints[:30], ensure_ascii=False)
+                    + "\n"
+                )
+
             prompt = (
                 "You are an expert image text analyzer for e-commerce product images.\n"
-                "Analyze this image and identify ALL Chinese text regions.\n\n"
+                "Analyze this image and identify ALL Chinese text regions, including "
+                "very faint semi-transparent seller watermarks crossing products.\n\n"
                 "For each text region, provide:\n"
                 '1. "box": [x1, y1, x2, y2] bounding box in PIXEL coordinates\n'
                 '2. "text": the original Chinese text\n'
                 '3. "translation": natural Malay (Bahasa Melayu) translation for Malaysian e-commerce\n'
                 '4. "orientation": "vertical" if text reads top-to-bottom, "horizontal" if left-to-right\n'
                 '5. "color": [R, G, B] the text color (0-255 per channel)\n'
-                '6. "font_size": approximate character height in pixels\n\n'
+                '6. "font_size": approximate character height in pixels\n'
+                '7. "kind": "watermark" for seller/company/business-name overlays, otherwise "content"\n\n'
                 "IMPORTANT RULES:\n"
                 "- For vertical text columns, each column is a SEPARATE entry\n"
                 "- Coordinates must be in actual pixel values of the image\n"
                 "- Translation must be natural Malaysian Malay, not literal word-by-word\n"
-                '- If text is a brand name or logo, set translation to empty string ""\n'
+                '- If text is a brand, logo, seller name, company name, shop name, or watermark, set kind to "watermark" and translation to empty string ""\n'
+                "- Chinese business suffixes such as 有限公司, 商行, and 个体工商户 always indicate a watermark, not product copy\n"
+                "- Do not return ordinary English, Malay, numbers, or existing package copy unless it is a brand/logo that must be removed\n"
                 "- Return ONLY valid JSON array, no markdown, no explanation\n\n"
+                + hint_text +
                 "Example output:\n"
                 '[{"box":[50,100,110,400],"text":"\u79c0\u51fa\u597d\u8eab\u6750","translation":"TONJOLKAN FIGURA MENAWAN","orientation":"vertical","color":[180,180,180],"font_size":55}]\n'
             )

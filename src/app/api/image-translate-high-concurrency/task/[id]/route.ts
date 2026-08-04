@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import prisma from "@/lib/prisma";
-import { signedUrl } from "@/lib/image-translate/oss";
+import { signedUrl } from "@/lib/image-translate-high-concurrency/oss";
 
 export const dynamic = "force-dynamic";
 
-const SERVICE_URL = process.env.IMAGE_TRANSLATE_SERVICE_URL || "http://127.0.0.1:8100";
+const SERVICE_URL = process.env.IMAGE_TRANSLATE_HIGH_SERVICE_URL || "http://127.0.0.1:8110";
 
 interface Props {
   params: Promise<{ id: string }>;
@@ -18,7 +18,7 @@ export async function GET(req: NextRequest, { params }: Props) {
   }
   const { id } = await params;
 
-  const task = await prisma.imageTranslateTask.findFirst({
+  const task = await prisma.imageTranslateHighTask.findFirst({
     where: { id, userId: session.user.id },
     include: { items: true },
   });
@@ -35,13 +35,13 @@ export async function GET(req: NextRequest, { params }: Props) {
         serviceResponded = true;
         const data = await resp.json();
         const newStatus = data.status === "done" ? "done" : data.status === "failed" ? "failed" : "processing";
-        await prisma.imageTranslateTask.update({
+        await prisma.imageTranslateHighTask.update({
           where: { id },
           data: { status: newStatus, doneCount: data.done, failedCount: data.failed },
         });
         // P1-401: If task failed, mark all pending items as failed too
         if (newStatus === "failed") {
-          await prisma.imageTranslateItem.updateMany({
+          await prisma.imageTranslateHighItem.updateMany({
             where: { taskId: id, status: "pending" },
             data: { status: "failed", error: "服务重启导致任务中断，请重新上传" },
           });
@@ -52,13 +52,21 @@ export async function GET(req: NextRequest, { params }: Props) {
             if (r.file === "*") continue;
             // Match item by sourceKey ending with the result filename
             const item = task.items.find((i) => i.sourceKey?.endsWith(r.file));
-            if (item) {
-              await prisma.imageTranslateItem.update({
+            const targetStatus = r.status === "success" ? "success" : "failed";
+            const targetOutputKey = r.output_key || null;
+            const targetError = r.error || null;
+            if (
+              item &&
+              (item.status !== targetStatus ||
+                item.outputKey !== targetOutputKey ||
+                item.error !== targetError)
+            ) {
+              await prisma.imageTranslateHighItem.update({
                 where: { id: item.id },
                 data: {
-                  status: r.status === "success" ? "success" : "failed",
-                  outputKey: r.output_key || null,
-                  error: r.error || null,
+                  status: targetStatus,
+                  outputKey: targetOutputKey,
+                  error: targetError,
                 },
               });
             }
@@ -70,15 +78,15 @@ export async function GET(req: NextRequest, { params }: Props) {
       }
     } catch { /* service unavailable, return cached state */ }
     // P1-007: If Python service returned 404 (task lost after restart), mark failed
-    if (!serviceResponded && (task.status === "processing" || task.status === "pending")) {
+    if (!serviceResponded && task.status === "processing") {
       try {
         const checkResp = await fetch(`${SERVICE_URL}/task/${id}`, { signal: AbortSignal.timeout(3000) });
         if (checkResp.status === 404) {
-          await prisma.imageTranslateTask.update({
+          await prisma.imageTranslateHighTask.update({
             where: { id },
             data: { status: "failed", report: "服务重启导致任务中断，请重新上传", failedCount: task.totalCount - task.doneCount },
           });
-          await prisma.imageTranslateItem.updateMany({
+          await prisma.imageTranslateHighItem.updateMany({
             where: { taskId: id, status: "pending" },
             data: { status: "failed", error: "服务重启导致任务中断，请重新上传" },
           });
@@ -89,7 +97,7 @@ export async function GET(req: NextRequest, { params }: Props) {
   }
 
   // Re-fetch items after potential update
-  const items = await prisma.imageTranslateItem.findMany({ where: { taskId: id } });
+  const items = await prisma.imageTranslateHighItem.findMany({ where: { taskId: id } });
 
   return NextResponse.json({
     id: task.id,

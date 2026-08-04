@@ -30,6 +30,7 @@ model User {
   costTemplates CostTemplate[]
   auditLogs     AuditLog[]
   imageTranslateTasks ImageTranslateTask[]
+  imageTranslateHighTasks ImageTranslateHighTask[]
 }
 
 enum UserRole {
@@ -302,6 +303,41 @@ model ImageTranslateItem {
   error     String?
 
   task ImageTranslateTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+}
+
+// ============ Image Translate High-Concurrency Tool ============
+
+model ImageTranslateHighTask {
+  id          String   @id @default(cuid())
+  userId      String
+  status      String   @default("pending")
+  totalCount  Int      @default(0)
+  doneCount   Int      @default(0)
+  failedCount Int      @default(0)
+  sourceDir   String
+  outputDir   String
+  report      String?  @db.Text
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user  User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items ImageTranslateHighItem[]
+
+  @@index([userId, createdAt])
+}
+
+model ImageTranslateHighItem {
+  id        String  @id @default(cuid())
+  taskId    String
+  fileName  String
+  sourceKey String
+  outputKey String?
+  status    String  @default("pending")
+  error     String?
+
+  task ImageTranslateHighTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
 
   @@index([taskId])
 }

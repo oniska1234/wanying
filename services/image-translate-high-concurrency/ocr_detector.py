@@ -21,6 +21,7 @@ from rapidocr_onnxruntime import RapidOCR
 from brand_removal import BrandPolicy, normalize_brand_text
 from translator import MalayTranslator, polish_malaysia_ecommerce
 from config import FONT_BOLD, FONT_REG, VERTICAL_LAYOUT_MODE
+from layout_planner import estimate_foreground_mask, plan_vertical_columns
 
 LOGGER = logging.getLogger("image_translate.ocr")
 
@@ -65,6 +66,12 @@ def normalize_text(text: str) -> str:
     return re.sub(r"[\s,，、。.!！?？:：;；·()（）\[\]【】_-]", "", text)
 
 
+def is_actionable_chinese_hit(hit: ChineseHit) -> bool:
+    """Filter low-confidence single-glyph OCR texture hallucinations."""
+    chinese_characters = CJK_RE.findall(normalize_text(hit.text))
+    return not (len(chinese_characters) == 1 and hit.confidence < 0.85)
+
+
 def box_overlap_ratio(
     first: tuple[int, int, int, int],
     second: tuple[int, int, int, int],
@@ -88,6 +95,216 @@ def is_box_handled(
     threshold: float = 0.35,
 ) -> bool:
     return any(box_overlap_ratio(box, handled) >= threshold for handled in handled_boxes)
+
+
+def _match_multiline_ocr_hints(
+    source_text: str,
+    ocr_hints: tuple[ChineseHit, ...],
+    *,
+    allow_short_containment: bool = False,
+) -> list[ChineseHit]:
+    """Anchor a vision paragraph to one or more OCR lines in source pixels."""
+    normalized_source = normalize_text(source_text)
+    if not normalized_source:
+        return []
+
+    minimum_fragment = 2 if allow_short_containment else max(
+        4, math.ceil(len(normalized_source) * 0.12),
+    )
+    contained = []
+    covered_characters = 0
+    for hit in ocr_hints:
+        normalized_hit = normalize_text(hit.text)
+        if (
+            len(normalized_hit) >= minimum_fragment
+            and normalized_hit in normalized_source
+        ):
+            contained.append(hit)
+            covered_characters += len(normalized_hit)
+    if contained and covered_characters / max(1, len(normalized_source)) >= 0.55:
+        return contained
+
+    return [
+        hit for hit in ocr_hints
+        if SequenceMatcher(
+            None,
+            normalized_source,
+            normalize_text(hit.text),
+        ).ratio() >= 0.72
+    ]
+
+
+def _infer_vision_coordinate_scale(
+    vision_data: list,
+    image_size: tuple[int, int],
+) -> float:
+    """Detect Qwen's common ~1280px internal coordinate canvas."""
+    extents = []
+    for item in vision_data:
+        box = item.get("box", []) if isinstance(item, dict) else []
+        if len(box) == 4:
+            try:
+                extents.append(max(float(box[2]), float(box[3])))
+            except (TypeError, ValueError):
+                continue
+    vision_extent = max(extents, default=0.0)
+    source_extent = float(max(image_size))
+    if 850.0 <= vision_extent <= 1600.0 and source_extent / vision_extent >= 1.35:
+        return source_extent / vision_extent
+    return 1.0
+
+
+def _scale_vision_box(
+    box: tuple[int, int, int, int],
+    image_size: tuple[int, int],
+    scale: float,
+) -> tuple[int, int, int, int]:
+    width, height = image_size
+    return (
+        max(0, min(width, round(box[0] * scale))),
+        max(0, min(height, round(box[1] * scale))),
+        max(0, min(width, round(box[2] * scale))),
+        max(0, min(height, round(box[3] * scale))),
+    )
+
+
+def _deduplicate_anchored_tasks(render_tasks: list[dict]) -> list[dict]:
+    """Prevent different translations from occupying the same source region."""
+    ranks = {"text": 3, "spatial": 2, "vision": 1}
+    retained: list[dict] = []
+    for task in render_tasks:
+        conflict_index = next(
+            (
+                index for index, existing in enumerate(retained)
+                if box_overlap_ratio(task["source_box"], existing["source_box"]) >= 0.72
+            ),
+            None,
+        )
+        if conflict_index is None:
+            retained.append(task)
+            continue
+        existing = retained[conflict_index]
+        if ranks.get(task.get("anchor_method"), 0) > ranks.get(existing.get("anchor_method"), 0):
+            retained[conflict_index] = task
+            kept, dropped = task, existing
+        else:
+            kept, dropped = existing, task
+        LOGGER.warning(
+            "Dropped duplicate vision anchor box=%s kept=%s dropped=%s",
+            kept["source_box"],
+            kept.get("source_text", "")[:30],
+            dropped.get("source_text", "")[:30],
+        )
+    return retained
+
+
+def _merge_overlapping_horizontal_tasks(
+    render_tasks: list[dict],
+    image_size: tuple[int, int],
+) -> list[dict]:
+    """Merge overlapping horizontal regions into one readable text block."""
+    horizontal = [
+        task for task in render_tasks
+        if task["orientation"] == "horizontal" and task["translation"]
+    ]
+    components: list[list[dict]] = []
+    remaining = list(horizontal)
+    while remaining:
+        component = [remaining.pop(0)]
+        changed = True
+        while changed:
+            changed = False
+            for candidate in list(remaining):
+                if any(
+                    box_overlap_ratio(candidate["box"], member["box"]) >= 0.18
+                    and math.dist(
+                        candidate["layout"].color,
+                        member["layout"].color,
+                    ) <= 90
+                    for member in component
+                ):
+                    component.append(candidate)
+                    remaining.remove(candidate)
+                    changed = True
+        components.append(component)
+
+    remove_ids: set[int] = set()
+    width, height = image_size
+    for component in components:
+        if len(component) < 2:
+            continue
+        ordered = sorted(component, key=lambda task: (task["box"][1], task["box"][0]))
+        left = min(task["box"][0] for task in ordered)
+        top = min(task["box"][1] for task in ordered)
+        right = max(task["box"][2] for task in ordered)
+        bottom = max(task["box"][3] for task in ordered)
+        pad_x = round(width * 0.008)
+        pad_y = round(height * 0.006)
+        merged_box = (
+            max(0, left - pad_x),
+            max(0, top - pad_y),
+            min(width, right + pad_x),
+            min(height, bottom + pad_y),
+        )
+        translations: list[str] = []
+        for task in ordered:
+            text = str(task["translation"]).strip()
+            if text and text not in translations:
+                translations.append(text)
+        primary = ordered[0]
+        old_layout = primary["layout"]
+        primary["translation"] = "\n".join(translations)
+        primary["box"] = merged_box
+        primary["layout"] = TextLayout(
+            angle=0.0,
+            font_size=max(18, min(64, (merged_box[3] - merged_box[1]) // max(2, len(translations)))),
+            color=old_layout.color,
+            is_bold=old_layout.is_bold,
+            box=merged_box,
+            line_count=len(translations),
+        )
+        primary["orientation"] = "horizontal-merged"
+        for task in ordered[1:]:
+            remove_ids.add(id(task))
+        LOGGER.info(
+            "Merged %d overlapping horizontal regions into box=%s",
+            len(ordered),
+            merged_box,
+        )
+    merged_tasks = [task for task in render_tasks if id(task) not in remove_ids]
+
+    # Adjacent header/body rows can overlap because OCR polygons include
+    # shadows and outlines. Keep their different colours, but split the shared
+    # vertical strip so the quality gate and renderer see disjoint boxes.
+    ordered_tasks = sorted(
+        [task for task in merged_tasks if task["orientation"].startswith("horizontal")],
+        key=lambda task: ((task["box"][1] + task["box"][3]) / 2, task["box"][0]),
+    )
+    for upper, lower in zip(ordered_tasks, ordered_tasks[1:]):
+        ux1, uy1, ux2, uy2 = upper["box"]
+        lx1, ly1, lx2, ly2 = lower["box"]
+        horizontal_overlap = max(0, min(ux2, lx2) - max(ux1, lx1))
+        minimum_width = max(1, min(ux2 - ux1, lx2 - lx1))
+        if (
+            uy2 > ly1
+            and horizontal_overlap / minimum_width >= 0.40
+            and box_overlap_ratio(upper["box"], lower["box"]) >= 0.18
+        ):
+            boundary = (uy2 + ly1) // 2
+            upper_box = (ux1, uy1, ux2, max(uy1 + 12, boundary - 2))
+            lower_box = (lx1, min(ly2 - 12, boundary + 2), lx2, ly2)
+            for task, new_box in ((upper, upper_box), (lower, lower_box)):
+                old_layout = task["layout"]
+                task["box"] = new_box
+                task["layout"] = TextLayout(
+                    angle=old_layout.angle,
+                    font_size=old_layout.font_size,
+                    color=old_layout.color,
+                    is_bold=old_layout.is_bold,
+                    box=new_box,
+                    line_count=old_layout.line_count,
+                )
+    return merged_tasks
 
 
 # Common phrase translations
@@ -152,6 +369,8 @@ PHRASE_TRANSLATIONS = {
     "弹力面料": "FABRIK ANJAL",
     "透气网纱": "JARING BERNAFAS",
     "舒适贴合": "SELESA & MELEKAT",
+    "手表": "Jam tangan",
+    "工厂": "Kilang",
 }
 
 NORMALIZED_TRANSLATIONS = {
@@ -325,6 +544,15 @@ def render_text_with_layout(
     color = layout.color
     is_bold = layout.is_bold
 
+    # Small ecommerce badges frequently use text and background from the same
+    # pastel palette.  Vision colour estimates can then land on the badge fill
+    # rather than the glyph.  Preserve the hue when possible, but enforce a
+    # modest contrast floor so the translation remains legible at thumbnail
+    # size.  Large headlines and vertical poster copy retain their source
+    # colour exactly.
+    if box_h <= image.height * 0.065 and abs(angle) % 180 <= 5:
+        color = _ensure_readable_color(image, box, color, minimum_ratio=2.5)
+
     # Choose font
     font_path = str(FONT_BOLD) if is_bold else str(FONT_REG)
     try:
@@ -341,10 +569,72 @@ def render_text_with_layout(
 
     if not needs_rotation:
         # Horizontal text: render directly with auto-fit
-        _render_horizontal(image, box, text, fnt, color, font_size)
+        _render_horizontal(
+            image,
+            box,
+            text,
+            fnt,
+            color,
+            font_size,
+            allow_wrap=(box_h >= image.height * 0.08 or "\n" in text),
+        )
     else:
         # Rotated text: render horizontal then rotate
         _render_rotated(image, box, text, color, angle, font_size, font_path)
+
+
+def _relative_luminance(color: tuple[int, int, int]) -> float:
+    channels = []
+    for value in color:
+        channel = value / 255.0
+        channels.append(
+            channel / 12.92
+            if channel <= 0.04045
+            else ((channel + 0.055) / 1.055) ** 2.4
+        )
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _contrast_ratio(first: tuple[int, int, int], second: tuple[int, int, int]) -> float:
+    first_lum = _relative_luminance(first)
+    second_lum = _relative_luminance(second)
+    lighter = max(first_lum, second_lum)
+    darker = min(first_lum, second_lum)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _ensure_readable_color(
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+    color: tuple[int, int, int],
+    *,
+    minimum_ratio: float,
+) -> tuple[int, int, int]:
+    x1, y1, x2, y2 = box
+    region = np.asarray(image.crop((x1, y1, x2, y2)).convert("RGB"))
+    if region.size == 0:
+        return color
+    background = tuple(int(value) for value in np.median(region.reshape(-1, 3), axis=0))
+    if _contrast_ratio(color, background) >= minimum_ratio:
+        return color
+
+    candidates: list[tuple[int, int, int]] = []
+    for factor in (0.78, 0.62, 0.46, 0.30):
+        candidates.append(tuple(round(value * factor) for value in color))
+    for factor in (0.25, 0.45, 0.65, 0.82):
+        candidates.append(tuple(round(value + (255 - value) * factor) for value in color))
+    passing = [
+        candidate for candidate in candidates
+        if _contrast_ratio(candidate, background) >= minimum_ratio
+    ]
+    if passing:
+        return min(
+            passing,
+            key=lambda candidate: sum(
+                (candidate[index] - color[index]) ** 2 for index in range(3)
+            ),
+        )
+    return max(candidates, key=lambda candidate: _contrast_ratio(candidate, background))
 
 
 def _render_horizontal(
@@ -354,6 +644,8 @@ def _render_horizontal(
     fnt: ImageFont.ImageFont,
     color: tuple[int, int, int],
     initial_size: int,
+    *,
+    allow_wrap: bool = True,
 ) -> None:
     """Render horizontal text with auto-fit font size."""
     x1, y1, x2, y2 = box
@@ -364,7 +656,7 @@ def _render_horizontal(
     # Try several word-wrapping layouts and keep the largest readable result.
     words = text.split()
     candidates = [text]
-    for line_count in range(2, min(4, len(words)) + 1):
+    for line_count in (range(2, min(4, len(words)) + 1) if allow_wrap else ()):
         lines: list[str] = []
         start = 0
         for line_index in range(line_count):
@@ -634,6 +926,10 @@ class ResidualChineseDetector:
     def __init__(self) -> None:
         self._ocr = RapidOCR(intra_op_num_threads=1, inter_op_num_threads=1)
         self._brand_policy = BrandPolicy()
+        self.last_layout_diagnostics: list[dict] = []
+        self.last_brand_boxes: list[tuple[int, int, int, int]] = []
+        self.last_watermark_diagnostics: list[dict] = []
+        self.last_remaining_hits: list[dict] = []
 
     def scan(self, image: Image.Image, *, minimum_confidence: float = 0.50) -> tuple[ChineseHit, ...]:
         rgb = image.convert("RGB")
@@ -685,7 +981,9 @@ class ResidualChineseDetector:
 
         if allow_repair:
             for _pass in range(2):
-                replacements = self._batch_translate_hits(current_hits, translator)
+                replacements = self._batch_translate_hits(
+                    current_hits, translator, image_size=edited.size,
+                )
                 if not replacements:
                     break
                 for hit, _ in replacements:
@@ -703,18 +1001,44 @@ class ResidualChineseDetector:
 
     def _batch_translate_hits(
         self, hits: tuple[ChineseHit, ...], translator: MalayTranslator | None,
+        *, image_size: tuple[int, int],
     ) -> list[tuple[ChineseHit, str]]:
         """Translate hits using batch API for efficiency."""
         replacements: list[tuple[ChineseHit, str]] = []
         needs_api: list[tuple[ChineseHit, str]] = []
 
         for hit in hits:
+            if self._brand_policy.is_brand_text(
+                hit.text,
+                confidence=hit.confidence,
+                box=hit.box,
+                image_size=image_size,
+            ):
+                replacements.append((hit, ""))
+                continue
             normalized = normalize_text(hit.text)
             direct = NORMALIZED_TRANSLATIONS.get(normalized)
             if direct is not None and hit.confidence >= 0.50:
                 replacements.append((hit, polish_malaysia_ecommerce(direct, source_text=hit.text)))
                 continue
             if hit.confidence < 0.60:
+                continue
+            center_y = (hit.box[1] + hit.box[3]) / 2
+            if (
+                len(normalized) <= 3
+                and re.fullmatch(r"[㐀-䶿一-鿿]+", normalized)
+                and image_size[1] * 0.25 <= center_y <= image_size[1] * 0.75
+                and hit.box[3] - hit.box[1] >= image_size[1] * 0.015
+            ):
+                # A short, isolated, pale OCR fragment in the product area is
+                # commonly the only readable part of a long seller watermark.
+                # Do not turn it into plausible-looking but wrong Malay copy;
+                # leaving it unresolved makes the final gate fail closed.
+                LOGGER.warning(
+                    "Deferred ambiguous central OCR fragment text=%s box=%s",
+                    hit.text,
+                    hit.box,
+                )
                 continue
             source_without_brand = self._brand_policy.remove_known_terms(hit.text)
             if source_without_brand != hit.text:
@@ -798,14 +1122,27 @@ class ResidualChineseDetector:
         Returns (modified_image, count_of_replacements, handled_boxes).
         """
         edited = image.copy().convert("RGB")
+        self.last_layout_diagnostics = []
+        self.last_brand_boxes = []
+        self.last_watermark_diagnostics = []
         count = 0
 
         hits_to_inpaint: list[ChineseHit] = []
+        watermark_regions: list[tuple[tuple[int, int, int, int], tuple[int, int, int]]] = []
         render_tasks: list[dict] = []
         handled_boxes: list[tuple[int, int, int, int]] = []
         ocr_hints = self.scan(edited, minimum_confidence=0.35)
         LOGGER.info("Applying %d vision text regions", len(vision_data))
         img_w, img_h = edited.size
+        vision_coordinate_scale = _infer_vision_coordinate_scale(
+            vision_data, edited.size,
+        )
+        if vision_coordinate_scale > 1.0:
+            LOGGER.info(
+                "Normalized vision coordinate canvas with scale %.3f",
+                vision_coordinate_scale,
+            )
+        foreground_mask: np.ndarray | None = None
 
         for item in vision_data:
             try:
@@ -823,39 +1160,195 @@ class ResidualChineseDetector:
                 source_text = str(item.get("text", ""))
                 raw_vision_box = (x1, y1, x2, y2)
                 normalized_source = normalize_text(source_text)
-                text_matches = [
-                    hit for hit in ocr_hints
-                    if normalized_source
-                    and SequenceMatcher(
-                        None,
-                        normalized_source,
-                        normalize_text(hit.text),
-                    ).ratio() >= 0.72
-                ]
+                policy_brand = self._brand_policy.is_brand_text(
+                    source_text,
+                    confidence=0.90,
+                    box=raw_vision_box,
+                    image_size=edited.size,
+                )
+                model_reports_watermark = (
+                    str(item.get("kind", "")).lower() == "watermark"
+                    and contains_chinese(source_text)
+                )
+                if (
+                    model_reports_watermark
+                    and not policy_brand
+                    and len(CJK_RE.findall(normalized_source)) <= 4
+                    and normalized_source not in NORMALIZED_TRANSLATIONS
+                ):
+                    # A model prompted with OCR hints may echo a short texture
+                    # hallucination as a watermark. Unknown short marks are
+                    # left untouched and resolved by the final confidence gate.
+                    LOGGER.info(
+                        "Deferred unverified short model watermark text=%s",
+                        source_text,
+                    )
+                    continue
+                source_is_brand = policy_brand or (
+                    model_reports_watermark
+                    and len(CJK_RE.findall(normalized_source)) >= 5
+                )
+                text_matches = _match_multiline_ocr_hints(
+                    source_text,
+                    ocr_hints,
+                    allow_short_containment=source_is_brand,
+                )
+                spatial_anchor_box = (
+                    raw_vision_box
+                    if source_is_brand
+                    else _scale_vision_box(
+                        raw_vision_box,
+                        edited.size,
+                        vision_coordinate_scale,
+                    )
+                )
                 spatial_matches = [
                     hit for hit in ocr_hints
-                    if box_overlap_ratio(hit.box, raw_vision_box) >= 0.25
+                    if box_overlap_ratio(hit.box, spatial_anchor_box) >= 0.25
                 ]
                 matched_hits = text_matches or spatial_matches
+                anchor_method = (
+                    "text" if text_matches
+                    else "spatial" if spatial_matches
+                    else "vision"
+                )
+                if (
+                    len(CJK_RE.findall(normalized_source)) == 1
+                    and matched_hits
+                    and max(hit.confidence for hit in matched_hits) < 0.85
+                ):
+                    LOGGER.info(
+                        "Ignored low-confidence single-glyph vision hint text=%s",
+                        source_text,
+                    )
+                    continue
                 if matched_hits:
                     # Qwen-VL may report coordinates in its internally resized
                     # image space. RapidOCR polygons are in actual source pixels,
                     # so matching by recognized text is the reliable anchor.
-                    vision_box = (
+                    matched_box = (
                         min(hit.box[0] for hit in matched_hits),
                         min(hit.box[1] for hit in matched_hits),
                         max(hit.box[2] for hit in matched_hits),
                         max(hit.box[3] for hit in matched_hits),
                     )
+                    vision_box = matched_box
+                    # Qwen-VL commonly reports coordinates on an internally
+                    # resized ~1000px canvas. For long business watermarks OCR
+                    # may only recognize a short suffix, so use that suffix as
+                    # the vertical anchor while retaining Qwen's scaled width.
+                    if (
+                        source_is_brand
+                        and (raw_vision_box[2] - raw_vision_box[0])
+                        > 2 * max(1, raw_vision_box[3] - raw_vision_box[1])
+                        and max(raw_coords) <= 1100
+                        and max(img_w, img_h) > 1200
+                    ):
+                        coordinate_scale = max(img_w, img_h) / 1000.0
+                        scaled_left = round(raw_vision_box[0] * coordinate_scale)
+                        scaled_right = round(raw_vision_box[2] * coordinate_scale)
+                        scaled_height = max(
+                            matched_box[3] - matched_box[1],
+                            round((raw_vision_box[3] - raw_vision_box[1]) * coordinate_scale),
+                        )
+                        center_y = (matched_box[1] + matched_box[3]) // 2
+                        vision_box = (
+                            max(0, min(matched_box[0], scaled_left)),
+                            max(0, center_y - scaled_height // 2),
+                            min(img_w, max(matched_box[2], scaled_right)),
+                            min(img_h, center_y + (scaled_height + 1) // 2),
+                        )
                     x1, y1, x2, y2 = vision_box
                 else:
-                    vision_box = raw_vision_box
+                    vision_box = (
+                        raw_vision_box
+                        if source_is_brand
+                        else spatial_anchor_box
+                    )
+                    if (
+                        source_is_brand
+                        and max(raw_coords) <= 1100
+                        and max(img_w, img_h) > 1200
+                    ):
+                        vision_box = (
+                            max(0, round(raw_vision_box[0] * img_w / 1000)),
+                            max(0, round(raw_vision_box[1] * img_h / 1000)),
+                            min(img_w, round(raw_vision_box[2] * img_w / 1000)),
+                            min(img_h, round(raw_vision_box[3] * img_h / 1000)),
+                        )
+                        x1, y1, x2, y2 = vision_box
 
-                translation = translator.validate_vision_translation(
-                    source_text,
-                    str(item.get("translation", "")),
-                )
+                # This product intentionally translates Chinese only. Vision
+                # models sometimes return nearby package English; preserve it
+                # unless it is explicitly classified as a brand/watermark.
+                if not contains_chinese(source_text) and not source_is_brand:
+                    continue
+
+                if source_is_brand:
+                    translation = ""
+                else:
+                    translation = translator.validate_vision_translation(
+                        source_text,
+                        str(item.get("translation", "")),
+                    )
                 handled_boxes.append(vision_box)
+
+                color = item.get("color", None)
+                if isinstance(color, list) and len(color) == 3:
+                    fg = tuple(max(0, min(255, int(c))) for c in color)
+                else:
+                    fg = _sample_text_color_from_image(edited, vision_box) or (30, 30, 30)
+                if source_is_brand:
+                    self.last_brand_boxes.append(vision_box)
+                    if foreground_mask is None:
+                        foreground_mask = estimate_foreground_mask(edited, [])
+                    region = foreground_mask[y1:y2, x1:x2]
+                    foreground_overlap = (
+                        float(np.count_nonzero(region)) / max(1, region.size)
+                    )
+                    normalized_watermark = normalize_text(source_text)
+                    extent_uncertain = False
+                    local_foreground_overlap = foreground_overlap
+                    if len(normalized_watermark) <= 3:
+                        local_mask = estimate_foreground_mask(edited, [vision_box])
+                        pad_x = max(20, (x2 - x1) * 2)
+                        pad_y = max(20, (y2 - y1) * 2)
+                        local_left = max(0, x1 - pad_x)
+                        local_top = max(0, y1 - pad_y)
+                        local_right = min(img_w, x2 + pad_x)
+                        local_bottom = min(img_h, y2 + pad_y)
+                        local_region = local_mask[
+                            local_top:local_bottom,
+                            local_left:local_right,
+                        ]
+                        local_foreground_overlap = (
+                            float(np.count_nonzero(local_region))
+                            / max(1, local_region.size)
+                        )
+                        extent_uncertain = local_foreground_overlap >= 0.18
+                    unsafe = (
+                        extent_uncertain
+                        or (
+                            (x2 - x1) / max(1, img_w) >= 0.35
+                            and foreground_overlap >= 0.18
+                        )
+                    )
+                    self.last_watermark_diagnostics.append({
+                        "box": list(vision_box),
+                        "foreground_overlap": round(foreground_overlap, 4),
+                        "local_foreground_overlap": round(local_foreground_overlap, 4),
+                        "extent_uncertain": extent_uncertain,
+                        "unsafe": unsafe,
+                    })
+                    if unsafe:
+                        LOGGER.warning(
+                            "Deferred watermark crossing foreground box=%s overlap=%.3f",
+                            vision_box,
+                            foreground_overlap,
+                        )
+                        continue
+                    watermark_regions.append((vision_box, fg))
+                    count += 1
 
                 if matched_hits:
                     hits_to_inpaint.extend(matched_hits)
@@ -872,12 +1365,6 @@ class ResidualChineseDetector:
 
                 # Build layout from vision data
                 orientation = item.get("orientation", "horizontal")
-                color = item.get("color", None)
-                if isinstance(color, list) and len(color) == 3:
-                    fg = tuple(int(c) for c in color)
-                else:
-                    fg = _sample_text_color_from_image(edited, (x1, y1, x2, y2)) or (30, 30, 30)
-
                 # Derive font_size from box dimensions (more reliable than Qwen-VL's value)
                 box_w_px = x2 - x1
                 box_h_px = y2 - y1
@@ -910,13 +1397,19 @@ class ResidualChineseDetector:
                            x1, y1, x2, y2, orientation, font_size, fg, translation[:20])
                 render_tasks.append({
                     "box": vision_box,
+                    "source_box": vision_box,
+                    "source_text": source_text,
                     "translation": translation,
                     "layout": layout,
                     "orientation": orientation,
+                    "anchor_method": anchor_method,
                 })
             except (ValueError, TypeError, KeyError) as e:
                 LOGGER.warning("Vision item parse error: %s", e)
                 continue
+
+        render_tasks = _deduplicate_anchored_tasks(render_tasks)
+        render_tasks = _merge_overlapping_horizontal_tasks(render_tasks, edited.size)
 
         # Reflow adjacent vertical Chinese columns into readable horizontal Malay
         # blocks. Long Latin phrases should not be squeezed into a 1-character
@@ -947,47 +1440,43 @@ class ResidualChineseDetector:
                 groups.append([task])
 
         for group in groups if VERTICAL_LAYOUT_MODE == "preserve" else []:
-            left = min(task["box"][0] for task in group)
-            top = min(task["box"][1] for task in group)
-            right = max(task["box"][2] for task in group)
-            original_width = right - left
-            preserve_left = max(0, left - round(original_width * 0.06))
-            preserve_right = min(
-                img_w,
-                round(img_w * 0.29),
-                right + round(original_width * 0.30),
+            plan = plan_vertical_columns(
+                edited,
+                [task["box"] for task in group],
+                [task["translation"] for task in group],
             )
-            preserve_top = max(0, top - round(img_h * 0.08))
-            preserve_bottom = max(
-                max(task["box"][3] for task in group),
-                round(img_h * 0.72),
-            )
-            gutter = max(6, round(img_w * 0.006))
-            total_width = max(1, preserve_right - preserve_left - gutter * (len(group) - 1))
-            column_width = max(1, total_width // len(group))
+            self.last_layout_diagnostics.append({
+                "orientation": "vertical-preserved",
+                "strategy": plan.strategy,
+                "score": plan.score,
+                "confidence": plan.confidence,
+                "foreground_overlap": plan.foreground_overlap,
+                "clearance_ratio": plan.clearance_ratio,
+                "boxes": [list(box) for box in plan.boxes],
+            })
 
             # Chinese columns read right-to-left. Put the right source column
             # into the left translated column to match the reference design.
-            for index, task in enumerate(reversed(group)):
-                column_left = preserve_left + index * (column_width + gutter)
-                column_box = (
-                    column_left,
-                    preserve_top,
-                    column_left + column_width,
-                    preserve_bottom,
-                )
+            for task, column_box in zip(reversed(group), plan.boxes):
                 old_layout = task["layout"]
                 task["box"] = column_box
                 task["layout"] = TextLayout(
                     angle=90.0,
-                    font_size=max(40, min(72, round(column_width * 0.44))),
+                    font_size=plan.font_size,
                     color=old_layout.color,
                     is_bold=False,
                     box=column_box,
                     line_count=1,
                 )
                 task["orientation"] = "vertical-preserved"
-            LOGGER.info("Preserved %d translations as continuous rotated columns", len(group))
+            LOGGER.info(
+                "Preserved %d translations with adaptive layout "
+                "(strategy=%s confidence=%.3f overlap=%.3f)",
+                len(group),
+                plan.strategy,
+                plan.confidence,
+                plan.foreground_overlap,
+            )
 
         for group in groups if VERTICAL_LAYOUT_MODE == "reflow" else []:
             left = min(task["box"][0] for task in group)
@@ -1059,9 +1548,53 @@ class ResidualChineseDetector:
                 task["orientation"] = "vertical-stacked"
             LOGGER.info("Kept %d translated regions as upright vertical columns", len(group))
 
+        vertical_diagnostic_boxes = {
+            tuple(box)
+            for diagnostic in self.last_layout_diagnostics
+            for box in diagnostic.get("boxes", [])
+        }
+        for task in render_tasks:
+            if tuple(task["box"]) in vertical_diagnostic_boxes:
+                continue
+            diagnostic = {
+                "orientation": task["orientation"],
+                "strategy": "source-region",
+                "score": 0.0,
+                "confidence": 1.0,
+                "foreground_overlap": 0.0,
+                "clearance_ratio": 1.0,
+                "boxes": [list(task["box"])],
+            }
+            task["_diagnostic"] = diagnostic
+            self.last_layout_diagnostics.append(diagnostic)
+
         # Inpaint all regions first
         if hits_to_inpaint:
             self._inpaint_hits(edited, hits_to_inpaint)
+        for task in render_tasks:
+            source_box = tuple(task.get("source_box", task["box"]))
+            source_width = source_box[2] - source_box[0]
+            source_height = source_box[3] - source_box[1]
+            needs_stylized_cleanup = (
+                task["orientation"].startswith("horizontal")
+                and source_width >= img_w * 0.25
+                and source_height >= img_h * 0.035
+            )
+            if not needs_stylized_cleanup:
+                continue
+            applied, dominance, selected_ratio = self._inpaint_flat_poster_text(
+                edited, source_box,
+            )
+            diagnostic = task.get("_diagnostic")
+            if diagnostic is not None:
+                diagnostic.update({
+                    "source_cleanup_required": True,
+                    "source_cleanup_applied": applied,
+                    "source_background_dominance": dominance,
+                    "source_cleanup_selected_ratio": selected_ratio,
+                })
+        for watermark_box, watermark_color in watermark_regions:
+            self._inpaint_watermark_region(edited, watermark_box, watermark_color)
 
         # Render with layout
         for task in render_tasks:
@@ -1114,6 +1647,9 @@ class ResidualChineseDetector:
             ring = cv2.subtract(ring, polygon_mask)
             ring_pixels = roi[ring > 0]
             if len(ring_pixels) >= 12:
+                if self._fill_smooth_text_region(roi, polygon_mask):
+                    pixels[top:bottom, left:right] = roi
+                    continue
                 background = np.median(ring_pixels.astype(np.float32), axis=0)
                 background_variation = float(
                     np.mean(np.std(ring_pixels.astype(np.float32), axis=0))
@@ -1148,6 +1684,254 @@ class ResidualChineseDetector:
             mask = cv2.dilate(mask, kernel, iterations=1)
             inpainted = cv2.inpaint(roi, mask, 3, cv2.INPAINT_TELEA)
             pixels[top:bottom, left:right] = inpainted
+        image.paste(Image.fromarray(pixels, mode="RGB"))
+
+    @staticmethod
+    def _fill_smooth_text_region(
+        roi: np.ndarray,
+        polygon_mask: np.ndarray,
+        *,
+        feather_sigma: float = 1.2,
+    ) -> bool:
+        """Reconstruct smooth poster gradients behind dense outlined glyphs.
+
+        Classical inpainting tends to copy a hollow glyph's own white outline
+        back into the hole.  A robust colour plane is safer when the perimeter
+        proves that the underlying design is smooth; textured/product regions
+        fail the residual check and keep the conservative inpainting path.
+        """
+        height, width = polygon_mask.shape
+        if height < 8 or width < 8:
+            return False
+        ring_radius = max(5, min(12, round(min(height, width) * 0.09)))
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (ring_radius * 2 + 1, ring_radius * 2 + 1),
+        )
+        outer_mask = cv2.dilate(polygon_mask, kernel, iterations=1)
+        fit_ring = (outer_mask > 0) & (polygon_mask == 0)
+        if np.count_nonzero(fit_ring) < 48:
+            return False
+
+        yy, xx = np.mgrid[0:height, 0:width]
+        normalized_x = xx[fit_ring].astype(np.float64) / max(1, width - 1)
+        normalized_y = yy[fit_ring].astype(np.float64) / max(1, height - 1)
+        design = np.column_stack((
+            np.ones(np.count_nonzero(fit_ring), dtype=np.float64),
+            normalized_x,
+            normalized_y,
+            normalized_x * normalized_x,
+            normalized_x * normalized_y,
+            normalized_y * normalized_y,
+        ))
+        samples = roi[fit_ring].astype(np.float64)
+        try:
+            coefficients = np.linalg.lstsq(design, samples, rcond=None)[0]
+            residuals = np.linalg.norm(samples - design @ coefficients, axis=1)
+            keep = residuals <= np.percentile(residuals, 70)
+            if np.count_nonzero(keep) < 36:
+                return False
+            coefficients = np.linalg.lstsq(
+                design[keep], samples[keep], rcond=None,
+            )[0]
+            residuals = np.linalg.norm(samples - design @ coefficients, axis=1)
+        except np.linalg.LinAlgError:
+            return False
+        if np.percentile(residuals, 70) > 18.0 or np.percentile(residuals, 90) > 35.0:
+            return False
+
+        complete_x = xx.ravel().astype(np.float64) / max(1, width - 1)
+        complete_y = yy.ravel().astype(np.float64) / max(1, height - 1)
+        complete_design = np.column_stack((
+            np.ones(height * width, dtype=np.float64),
+            complete_x,
+            complete_y,
+            complete_x * complete_x,
+            complete_x * complete_y,
+            complete_y * complete_y,
+        ))
+        prediction = np.clip(
+            complete_design @ coefficients, 0, 255,
+        ).reshape(height, width, 3).astype(np.uint8)
+        glyph_extent = cv2.dilate(
+            polygon_mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=1,
+        )
+        alpha = cv2.GaussianBlur(
+            glyph_extent, (0, 0), feather_sigma,
+        ).astype(np.float32) / 255.0
+        roi[:] = (
+            roi.astype(np.float32) * (1.0 - alpha[:, :, None])
+            + prediction.astype(np.float32) * alpha[:, :, None]
+        ).astype(np.uint8)
+        return True
+
+    @staticmethod
+    def _inpaint_flat_poster_text(
+        image: Image.Image,
+        box: tuple[int, int, int, int],
+    ) -> tuple[bool, float, float]:
+        """Clean large stylized copy when it sits on a dominant poster colour."""
+        pixels = np.asarray(image.convert("RGB")).copy()
+        height, width = pixels.shape[:2]
+        x1, y1, x2, y2 = box
+        pad = max(12, round(min(width, height) * 0.016))
+        left = max(0, x1 - pad)
+        top = max(0, y1 - pad)
+        right = min(width, x2 + pad)
+        bottom = min(height, y2 + pad)
+        if right <= left or bottom <= top:
+            return False, 0.0, 0.0
+
+        outer = pixels[top:bottom, left:right]
+        inner_left = x1 - left
+        inner_top = y1 - top
+        inner_right = x2 - left
+        inner_bottom = y2 - top
+        ring_mask = np.ones(outer.shape[:2], dtype=bool)
+        ring_mask[inner_top:inner_bottom, inner_left:inner_right] = False
+        ring_pixels = outer[ring_mask]
+        if len(ring_pixels) < 24:
+            return False, 0.0, 0.0
+
+        quantized = (ring_pixels // 24).astype(np.int16)
+        buckets, counts = np.unique(quantized, axis=0, return_counts=True)
+        dominant_bucket = buckets[int(np.argmax(counts))]
+        dominant_members = ring_pixels[np.all(quantized == dominant_bucket, axis=1)]
+        background = np.median(dominant_members.astype(np.float32), axis=0)
+        dominance = len(dominant_members) / len(ring_pixels)
+        if dominance < 0.30:
+            return False, round(dominance, 4), 0.0
+
+        roi = outer[inner_top:inner_bottom, inner_left:inner_right]
+        distance = np.linalg.norm(roi.astype(np.float32) - background, axis=2)
+        ring_distance = np.linalg.norm(
+            ring_pixels.astype(np.float32) - background,
+            axis=1,
+        )
+        threshold = max(30.0, float(np.percentile(ring_distance, 72)) + 8.0)
+        mask = np.where(distance >= threshold, 255, 0).astype(np.uint8)
+        selected_ratio = np.count_nonzero(mask) / max(1, mask.size)
+        # The first-stage smooth-background reconstruction may already have
+        # removed every source glyph.  A homogeneous region on a proven
+        # dominant background is therefore a successful cleanup, not a low-
+        # confidence failure.
+        already_clean = selected_ratio < 0.015
+        # Hollow, outlined marketplace headlines can legitimately occupy most
+        # of their OCR box.  The surrounding-ring dominance check above is the
+        # safety signal that proves a reconstructable poster background; allow
+        # dense headline artwork while continuing to reject nearly full-frame
+        # or product-like regions.
+        upper_limit = 0.96 if dominance >= 0.50 else 0.75
+        full_mask = np.zeros(outer.shape[:2], dtype=np.uint8)
+        # OCR boxes usually follow the coloured inner strokes and omit the
+        # outer white outline/drop shadow.  Extend only within the already
+        # validated flat-background ring so those recognizable source-shaped
+        # scallops do not survive around the translation.
+        fill_pad = max(2, min(pad // 2, round((y2 - y1) * 0.12)))
+        fill_left = max(0, inner_left - fill_pad)
+        fill_top = max(0, inner_top - fill_pad)
+        fill_right = min(outer.shape[1], inner_right + fill_pad)
+        fill_bottom = min(outer.shape[0], inner_bottom + fill_pad)
+        full_mask[fill_top:fill_bottom, fill_left:fill_right] = 255
+        feather_sigma = max(4.0, min(10.0, pad * 0.30))
+
+        if not already_clean and selected_ratio > upper_limit:
+            # A single-colour distance model classifies nearly every pixel of
+            # a smooth gradient as foreground. Before failing closed, prove
+            # that the surrounding panel can reconstruct a quadratic colour
+            # surface. Product/photo regions retain high residuals and still
+            # fail this conservative fallback.
+            if ResidualChineseDetector._fill_smooth_text_region(
+                outer, full_mask, feather_sigma=feather_sigma,
+            ):
+                pixels[top:bottom, left:right] = outer
+                image.paste(Image.fromarray(pixels, mode="RGB"))
+                return True, round(dominance, 4), round(selected_ratio, 4)
+            return False, round(dominance, 4), round(selected_ratio, 4)
+
+        # On a proven dominant poster background, replace the complete source
+        # title region. Mask-only inpainting of large hollow glyphs can borrow
+        # their own outlines and leave recognizable Chinese-shaped ghosts.
+        # Prefer a robust linear colour surface so mild poster gradients stay
+        # continuous instead of becoming a visible solid rectangle.  The
+        # constant dominant-colour fill remains the fallback for truly flat
+        # backgrounds or numerically unstable fits.
+        if not ResidualChineseDetector._fill_smooth_text_region(
+            outer, full_mask, feather_sigma=feather_sigma,
+        ):
+            alpha = cv2.GaussianBlur(
+                full_mask, (0, 0), feather_sigma,
+            ).astype(np.float32) / 255.0
+            fill = np.empty_like(outer)
+            fill[:, :] = np.clip(background, 0, 255).astype(np.uint8)
+            outer = (
+                outer.astype(np.float32) * (1.0 - alpha[:, :, None])
+                + fill.astype(np.float32) * alpha[:, :, None]
+            ).astype(np.uint8)
+        pixels[top:bottom, left:right] = outer
+        image.paste(Image.fromarray(pixels, mode="RGB"))
+        return True, round(dominance, 4), round(selected_ratio, 4)
+
+    @staticmethod
+    def _inpaint_watermark_region(
+        image: Image.Image,
+        box: tuple[int, int, int, int],
+        color: tuple[int, int, int],
+    ) -> None:
+        """Remove a faint, long watermark without flattening its full box.
+
+        Marketplace seller watermarks often span most of the image and cross
+        several different backgrounds. Filling the whole rectangle damages the
+        product, while polygon OCR usually sees only a suffix. This mask keeps
+        pixels that both resemble the reported light/dark glyph colour and
+        deviate from a locally blurred background.
+        """
+        pixels = np.asarray(image.convert("RGB")).copy()
+        height, width = pixels.shape[:2]
+        x1, y1, x2, y2 = box
+        pad = max(3, min(16, round((y2 - y1) * 0.08)))
+        left = max(0, x1 - pad)
+        top = max(0, y1 - pad)
+        right = min(width, x2 + pad)
+        bottom = min(height, y2 + pad)
+        if right <= left or bottom <= top:
+            return
+
+        roi = pixels[top:bottom, left:right]
+        gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+        local_background = cv2.GaussianBlur(gray, (0, 0), 6.0)
+        reported_luminance = (
+            0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+        )
+        if reported_luminance >= 150:
+            candidate = (
+                (gray.astype(np.int16) - local_background.astype(np.int16) >= 3)
+                & (gray >= 145)
+                & (hsv[:, :, 1] <= 110)
+            )
+        else:
+            candidate = (
+                (local_background.astype(np.int16) - gray.astype(np.int16) >= 4)
+                & (gray <= 135)
+            )
+        mask = np.where(candidate, 255, 0).astype(np.uint8)
+        selected_ratio = np.count_nonzero(mask) / max(1, mask.size)
+        if selected_ratio < 0.0008 or selected_ratio > 0.24:
+            LOGGER.warning(
+                "Skipped unsafe watermark mask box=%s ratio=%.4f",
+                box,
+                selected_ratio,
+            )
+            return
+
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+        mask = cv2.dilate(mask, close_kernel, iterations=1)
+        roi = cv2.inpaint(roi, mask, 4, cv2.INPAINT_TELEA)
+        pixels[top:bottom, left:right] = roi
         image.paste(Image.fromarray(pixels, mode="RGB"))
 
     @staticmethod

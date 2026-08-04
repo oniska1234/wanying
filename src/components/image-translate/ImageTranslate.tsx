@@ -26,7 +26,13 @@ interface TaskDetail extends TaskInfo {
   items: TaskItem[];
 }
 
-export default function ImageTranslate() {
+export default function ImageTranslate({
+  apiBase = "/api/image-translate",
+  outputHint,
+}: {
+  apiBase?: string;
+  outputHint?: string;
+}) {
   const { status: authStatus } = useSession();
   const [files, setFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -38,19 +44,22 @@ export default function ImageTranslate() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const loadHistory = useCallback(async () => {
+  const loadHistory = useCallback(async (): Promise<TaskInfo[]> => {
     try {
-      const res = await fetch("/api/image-translate/tasks?page=1&page_size=20");
+      const res = await fetch(`${apiBase}/tasks?page=1&page_size=20`);
       if (res.ok) {
         const data = await res.json();
-        setHistory(data.items || []);
+        const items = data.items || [];
+        setHistory(items);
+        return items;
       }
     } catch { /* ignore */ }
-  }, []);
+    return [];
+  }, [apiBase]);
 
   const pollTask = useCallback(async (taskId: string) => {
     try {
-      const res = await fetch(`/api/image-translate/task/${taskId}`);
+      const res = await fetch(`${apiBase}/task/${taskId}`);
       if (res.ok) {
         const data: TaskDetail = await res.json();
         setCurrentTask(data);
@@ -66,13 +75,16 @@ export default function ImageTranslate() {
   const startPolling = useCallback((taskId: string) => {
     if (pollRef.current) clearInterval(pollRef.current);
     pollTask(taskId);
-    pollRef.current = setInterval(() => pollTask(taskId), 3000);
+    pollRef.current = setInterval(() => pollTask(taskId), 5000);
   }, [pollTask]);
 
   useEffect(() => {
-    loadHistory();
+    void loadHistory().then((tasks) => {
+      const active = tasks.find((task) => task.status === "processing");
+      if (active) startPolling(active.id);
+    });
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [loadHistory]);
+  }, [loadHistory, startPolling]);
 
   const handleFiles = (newFiles: FileList | File[]) => {
     const arr = Array.from(newFiles).filter((f) =>
@@ -102,18 +114,21 @@ export default function ImageTranslate() {
     const formData = new FormData();
     files.forEach((f) => formData.append("files", f));
     try {
-      const res = await fetch("/api/image-translate/upload", { method: "POST", body: formData });
+      const res = await fetch(`${apiBase}/upload`, { method: "POST", body: formData });
       const data = await res.json();
       if (!res.ok) { setError(data.error || "提交失败"); return; }
       setFiles([]);
       setCurrentTask({ id: data.task_id, status: "processing", total_count: data.total, done_count: 0, failed_count: 0, created_at: new Date().toISOString(), items: [] });
       startPolling(data.task_id);
-    } catch { setError("网络错误"); }
+    } catch {
+      setError("服务器上传连接超时或响应中断，任务可能仍在后台处理；已自动刷新历史记录");
+      await loadHistory();
+    }
     finally { setUploading(false); }
   };
 
   const viewTask = async (taskId: string) => {
-    const res = await fetch(`/api/image-translate/task/${taskId}`);
+    const res = await fetch(`${apiBase}/task/${taskId}`);
     if (res.ok) {
       const data: TaskDetail = await res.json();
       setCurrentTask(data);
@@ -135,6 +150,9 @@ export default function ImageTranslate() {
     <div className="space-y-6">
       {/* Upload Area */}
       <section className="rounded-xl border border-line bg-card p-5">
+        {outputHint && (
+          <p className="mb-4 rounded-lg bg-accent/10 px-3 py-2 text-sm text-accent">{outputHint}</p>
+        )}
         <div
           className={`relative grid place-items-center rounded-lg border-2 border-dashed p-10 transition-colors ${dragOver ? "border-accent bg-accent/5" : "border-line hover:border-accent/50"}`}
           onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
@@ -209,7 +227,7 @@ export default function ImageTranslate() {
           )}
 
           {currentTask.status === "done" && (
-            <a href={`/api/image-translate/download/${currentTask.id}`} className="mt-4 inline-flex items-center gap-2 rounded-lg bg-green-600 px-4 py-2 text-sm font-medium text-white hover:bg-green-700">
+            <a href={`${apiBase}/download/${currentTask.id}`} className="mt-4 inline-flex items-center gap-2 rounded-lg bg-green-600 px-4 py-2 text-sm font-medium text-white hover:bg-green-700">
               <Download size={16} /> 打包下载 ZIP
             </a>
           )}
@@ -238,7 +256,7 @@ export default function ImageTranslate() {
                     <td className="py-2 pr-4 text-xs text-muted">{new Date(t.created_at).toLocaleString("zh-CN")}</td>
                     <td className="py-2">
                       <button onClick={() => viewTask(t.id)} className="mr-2 text-xs text-accent hover:underline">查看</button>
-                      {t.status === "done" && <a href={`/api/image-translate/download/${t.id}`} className="text-xs text-green-600 hover:underline">下载</a>}
+                      {t.status === "done" && <a href={`${apiBase}/download/${t.id}`} className="text-xs text-green-600 hover:underline">下载</a>}
                     </td>
                   </tr>
                 ))}

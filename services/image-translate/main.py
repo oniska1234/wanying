@@ -278,22 +278,35 @@ def _process_task(task_id: str, user_id: str, image_keys: list[str]) -> None:
             result = pipeline.process_image(src, out_path)
 
             if result["status"] == "success":
-                task["done"] += 1
                 output_key = ""
+                upload_error = ""
                 if oss and oss.available and out_path.is_file():
                     output_key = f"image-translate/{user_id}/{task_id}/output/{out_path.name}"
                     try:
                         oss.upload_file(out_path, output_key)
                     except Exception as exc:
                         LOGGER.warning("Failed to upload output %s: %s", out_path.name, exc)
-                task["results"].append({
-                    "file": src.name,
-                    "status": "success",
-                    "output_key": output_key,
-                    "repaired": result.get("repaired_phrases", 0),
-                    "brands_removed": result.get("removed_brands", 0),
-                    "enhanced": result.get("enhanced", False),
-                })
+                        upload_error = "结果上传失败，请重试"
+                else:
+                    upload_error = "结果存储服务不可用"
+
+                if output_key and not upload_error:
+                    task["done"] += 1
+                    task["results"].append({
+                        "file": src.name,
+                        "status": "success",
+                        "output_key": output_key,
+                        "repaired": result.get("repaired_phrases", 0),
+                        "brands_removed": result.get("removed_brands", 0),
+                        "enhanced": result.get("enhanced", False),
+                    })
+                else:
+                    task["failed"] += 1
+                    task["results"].append({
+                        "file": src.name,
+                        "status": "failed",
+                        "error": upload_error or "结果上传失败",
+                    })
             else:
                 task["failed"] += 1
                 task["results"].append({
@@ -305,7 +318,7 @@ def _process_task(task_id: str, user_id: str, image_keys: list[str]) -> None:
             _db_save_task(task_id, task)
             LOGGER.info("Task %s: %d/%d processed", task_id, index, len(local_inputs))
 
-        task["status"] = "done"
+        task["status"] = "failed" if task["done"] == 0 and task["failed"] > 0 else "done"
         _db_save_task(task_id, task)
         LOGGER.info(
             "Task %s complete: %d done, %d failed",
