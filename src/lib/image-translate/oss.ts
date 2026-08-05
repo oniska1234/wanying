@@ -1,18 +1,31 @@
 import OSS from "ali-oss";
 
 let client: OSS | null = null;
+let publicClient: OSS | null = null;
+
+function clientOptions(internal: boolean) {
+  return {
+    region: process.env.OSS_REGION || "oss-cn-shenzhen",
+    internal,
+    secure: true,
+    accessKeyId: process.env.OSS_ACCESS_KEY_ID || "",
+    accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET || "",
+    bucket: process.env.OSS_BUCKET || "transfer-pic",
+  };
+}
 
 export function getOSSClient(): OSS {
   if (!client) {
-    client = new OSS({
-      region: process.env.OSS_REGION || "oss-cn-shenzhen",
-      secure: true,
-      accessKeyId: process.env.OSS_ACCESS_KEY_ID || "",
-      accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET || "",
-      bucket: process.env.OSS_BUCKET || "transfer-pic",
-    });
+    client = new OSS(clientOptions(true));
   }
   return client;
+}
+
+function getPublicOSSClient(): OSS {
+  if (!publicClient) {
+    publicClient = new OSS(clientOptions(false));
+  }
+  return publicClient;
 }
 
 export function inputPrefix(userId: string, taskId: string): string {
@@ -30,7 +43,9 @@ export async function uploadBuffer(key: string, buffer: Buffer): Promise<string>
 }
 
 export function signedUrl(key: string, expires = 3600): string {
-  const oss = getOSSClient();
+  // Browser-facing links must use the public endpoint. Only server-side data
+  // transfer uses the Shenzhen intranet endpoint.
+  const oss = getPublicOSSClient();
   return oss.signatureUrl(key, { expires });
 }
 

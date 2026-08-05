@@ -1,29 +1,41 @@
 import OSS from "ali-oss";
 
 let client: OSS | null = null;
+let publicClient: OSS | null = null;
 
 // Keep an extended timeout/retry budget for weak client links and transient
 // OSS errors even though production storage now lives in the same region.
 const OSS_REQUEST_TIMEOUT_MS = 180_000;
 const OSS_RETRY_MAX = 2;
 
+function clientOptions(internal: boolean) {
+  return {
+    region: process.env.OSS_REGION || "oss-cn-shenzhen",
+    internal,
+    secure: true,
+    accessKeyId: process.env.OSS_ACCESS_KEY_ID || "",
+    accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET || "",
+    bucket: process.env.OSS_BUCKET || "transfer-pic",
+    timeout: OSS_REQUEST_TIMEOUT_MS,
+    retryMax: OSS_RETRY_MAX,
+  };
+}
+
 export function getOSSClient(): OSS {
   if (!client) {
     // ali-oss 6.23 supports retryMax at runtime, but its public Options type
     // does not currently declare the field. Keeping the config in a variable
     // avoids losing the supported runtime option to an unnecessary type cast.
-    const options = {
-      region: process.env.OSS_REGION || "oss-cn-shenzhen",
-      secure: true,
-      accessKeyId: process.env.OSS_ACCESS_KEY_ID || "",
-      accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET || "",
-      bucket: process.env.OSS_BUCKET || "transfer-pic",
-      timeout: OSS_REQUEST_TIMEOUT_MS,
-      retryMax: OSS_RETRY_MAX,
-    };
-    client = new OSS(options);
+    client = new OSS(clientOptions(true));
   }
   return client;
+}
+
+function getPublicOSSClient(): OSS {
+  if (!publicClient) {
+    publicClient = new OSS(clientOptions(false));
+  }
+  return publicClient;
 }
 
 export function inputPrefix(userId: string, taskId: string): string {
@@ -47,7 +59,9 @@ export async function deleteObjects(keys: string[]): Promise<void> {
 }
 
 export function signedUrl(key: string, expires = 3600): string {
-  const oss = getOSSClient();
+  // Browser-facing links must remain public even when server-side transfers
+  // use the much faster same-region intranet endpoint.
+  const oss = getPublicOSSClient();
   return oss.signatureUrl(key, { expires });
 }
 

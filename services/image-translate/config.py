@@ -44,7 +44,10 @@ GOOGLE_FAILURE_LIMIT = 2
 # OSS configuration
 OSS_ACCESS_KEY_ID = os.environ.get("OSS_ACCESS_KEY_ID", "")
 OSS_ACCESS_KEY_SECRET = os.environ.get("OSS_ACCESS_KEY_SECRET", "")
-OSS_ENDPOINT = os.environ.get("OSS_ENDPOINT", "https://oss-cn-shenzhen.aliyuncs.com")
+OSS_ENDPOINT = os.environ.get(
+    "OSS_ENDPOINT",
+    "https://oss-cn-shenzhen-internal.aliyuncs.com",
+)
 OSS_BUCKET_NAME = os.environ.get("OSS_BUCKET_NAME", "transfer-pic")
 OSS_PREFIX = "image-translate"
 
