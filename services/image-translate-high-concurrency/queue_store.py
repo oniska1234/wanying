@@ -434,6 +434,7 @@ class DurableQueue:
                     "status": "failed",
                     "error": error,
                     "attempts": item.attempts,
+                    "duration_ms": duration_ms,
                     **(details or {}),
                 }
                 connection.execute(
@@ -469,6 +470,11 @@ class DurableQueue:
                 ).fetchall()
                 identifiers = [str(item["task_id"]) for item in active]
                 position = identifiers.index(task_id) + 1 if task_id in identifiers else 0
+            started_at = row["started_at"]
+            completed_at = row["completed_at"]
+            duration_ms = round(
+                (float(completed_at or time.time()) - float(started_at)) * 1000
+            ) if started_at is not None else 0
             return {
                 "status": str(row["status"]),
                 "total": int(row["total"]),
@@ -476,8 +482,9 @@ class DurableQueue:
                 "failed": int(row["failed"]),
                 "results": json.loads(row["results"] or "[]"),
                 "queue_position": position,
-                "started_at": row["started_at"],
-                "completed_at": row["completed_at"],
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "duration_ms": max(0, duration_ms),
             }
 
     def metrics(self) -> dict:

@@ -26,8 +26,9 @@ export async function GET(req: NextRequest, { params }: Props) {
     return NextResponse.json({ error: "任务不存在" }, { status: 404 });
   }
 
-  // If still processing, sync from Python service
-  if (task.status === "processing" || task.status === "pending") {
+  // Sync active tasks and lazily backfill timing for completed tasks created
+  // before timing fields were added.
+  if (task.status === "processing" || task.status === "pending" || task.durationMs === null) {
     let serviceResponded = false;
     try {
       const resp = await fetch(`${SERVICE_URL}/task/${id}`, { signal: AbortSignal.timeout(5000) });
@@ -35,9 +36,10 @@ export async function GET(req: NextRequest, { params }: Props) {
         serviceResponded = true;
         const data = await resp.json();
         const newStatus = data.status === "done" ? "done" : data.status === "failed" ? "failed" : "processing";
+        const durationMs = Number.isFinite(data.duration_ms) ? Math.max(0, Math.round(data.duration_ms)) : null;
         await prisma.imageTranslateHighTask.update({
           where: { id },
-          data: { status: newStatus, doneCount: data.done, failedCount: data.failed },
+          data: { status: newStatus, doneCount: data.done, failedCount: data.failed, durationMs },
         });
         // P1-401: If task failed, mark all pending items as failed too
         if (newStatus === "failed") {
@@ -57,11 +59,17 @@ export async function GET(req: NextRequest, { params }: Props) {
               : "failed";
             const targetOutputKey = r.output_key || null;
             const targetError = r.error || r.review_message || null;
+            const targetDurationMs = Number.isFinite(r.duration_ms)
+              ? Math.max(0, Math.round(r.duration_ms))
+              : null;
+            const targetCacheHit = r.cache_hit === true;
             if (
               item &&
               (item.status !== targetStatus ||
                 item.outputKey !== targetOutputKey ||
-                item.error !== targetError)
+                item.error !== targetError ||
+                item.durationMs !== targetDurationMs ||
+                item.cacheHit !== targetCacheHit)
             ) {
               await prisma.imageTranslateHighItem.update({
                 where: { id: item.id },
@@ -69,6 +77,8 @@ export async function GET(req: NextRequest, { params }: Props) {
                   status: targetStatus,
                   outputKey: targetOutputKey,
                   error: targetError,
+                  durationMs: targetDurationMs,
+                  cacheHit: targetCacheHit,
                 },
               });
             }
@@ -77,6 +87,7 @@ export async function GET(req: NextRequest, { params }: Props) {
         task.status = newStatus;
         task.doneCount = data.done;
         task.failedCount = data.failed;
+        task.durationMs = durationMs;
       }
     } catch { /* service unavailable, return cached state */ }
     // P1-007: If Python service returned 404 (task lost after restart), mark failed
@@ -101,6 +112,12 @@ export async function GET(req: NextRequest, { params }: Props) {
   // Re-fetch items after potential update
   const items = await prisma.imageTranslateHighItem.findMany({ where: { taskId: id } });
   const reviewCount = items.filter((item) => item.status === "review").length;
+  const measuredDurations = items.flatMap((item) =>
+    item.durationMs === null ? [] : [item.durationMs]
+  );
+  const averageDurationMs = measuredDurations.length > 0
+    ? Math.round(measuredDurations.reduce((sum, duration) => sum + duration, 0) / measuredDurations.length)
+    : null;
 
   return NextResponse.json({
     id: task.id,
@@ -109,6 +126,8 @@ export async function GET(req: NextRequest, { params }: Props) {
     done_count: task.doneCount,
     failed_count: task.failedCount,
     review_count: reviewCount,
+    duration_ms: task.durationMs,
+    average_duration_ms: averageDurationMs,
     created_at: task.createdAt.toISOString(),
     items: items.map((i) => ({
       id: i.id,
@@ -117,6 +136,8 @@ export async function GET(req: NextRequest, { params }: Props) {
       source_url: i.sourceKey ? signedUrl(i.sourceKey) : null,
       output_url: i.outputKey ? signedUrl(i.outputKey) : null,
       error: i.error,
+      duration_ms: i.durationMs,
+      cache_hit: i.cacheHit,
     })),
   });
 }

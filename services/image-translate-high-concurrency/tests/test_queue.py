@@ -106,6 +106,8 @@ class DurableQueueTests(unittest.TestCase):
         assert task is not None
         self.assertEqual(task["status"], "failed")
         self.assertEqual(task["failed"], 1)
+        self.assertGreaterEqual(task["duration_ms"], 0)
+        self.assertEqual(task["results"][0]["duration_ms"], 10)
 
         metrics = self.queue.metrics()
         self.assertEqual(metrics["failure_reasons"], {"unclassified": 1})

@@ -319,6 +319,7 @@ model ImageTranslateHighTask {
   sourceDir   String
   outputDir   String
   report      String?  @db.Text
+  durationMs  Int?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
@@ -336,6 +337,8 @@ model ImageTranslateHighItem {
   outputKey String?
   status    String  @default("pending")
   error     String?
+  durationMs Int?
+  cacheHit   Boolean @default(false)
 
   task ImageTranslateHighTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
 

@@ -11,6 +11,8 @@ interface TaskItem {
   source_url: string | null;
   output_url: string | null;
   error: string | null;
+  duration_ms?: number | null;
+  cache_hit?: boolean;
 }
 
 interface TaskInfo {
@@ -21,6 +23,8 @@ interface TaskInfo {
   failed_count: number;
   review_count?: number;
   created_at: string;
+  duration_ms?: number | null;
+  average_duration_ms?: number | null;
 }
 
 interface TaskDetail extends TaskInfo {
@@ -44,6 +48,7 @@ export default function ImageTranslate({
   const [previewIndex, setPreviewIndex] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const showTiming = apiBase.includes("high-concurrency");
 
   const loadHistory = useCallback(async (): Promise<TaskInfo[]> => {
     try {
@@ -119,7 +124,7 @@ export default function ImageTranslate({
       const data = await res.json();
       if (!res.ok) { setError(data.error || "提交失败"); return; }
       setFiles([]);
-      setCurrentTask({ id: data.task_id, status: "processing", total_count: data.total, done_count: 0, failed_count: 0, review_count: 0, created_at: new Date().toISOString(), items: [] });
+      setCurrentTask({ id: data.task_id, status: "processing", total_count: data.total, done_count: 0, failed_count: 0, review_count: 0, created_at: new Date().toISOString(), duration_ms: 0, average_duration_ms: null, items: [] });
       startPolling(data.task_id);
     } catch {
       setError("服务器上传连接超时或响应中断，任务可能仍在后台处理；已自动刷新历史记录");
@@ -203,6 +208,8 @@ export default function ImageTranslate({
             完成 {currentTask.done_count}
             {(currentTask.review_count || 0) > 0 && `（其中 ${currentTask.review_count} 张需确认）`}
             {` · 失败 ${currentTask.failed_count} · 总计 ${currentTask.total_count}`}
+            {showTiming && currentTask.average_duration_ms != null && ` · 单张平均 ${formatDuration(currentTask.average_duration_ms)}`}
+            {showTiming && currentTask.duration_ms != null && ` · ${currentTask.status === "processing" ? "已用时" : "本批耗时"} ${formatDuration(currentTask.duration_ms)}`}
           </p>
 
           {currentTask.items && currentTask.items.length > 0 && (
@@ -234,6 +241,15 @@ export default function ImageTranslate({
                   {item.status === "failed" && item.error && (
                     <p className="mt-2 text-xs text-red-500">{item.error}</p>
                   )}
+                  {showTiming && (
+                    <p className={`mt-2 text-xs ${item.cache_hit ? "text-green-600" : "text-muted"}`}>
+                      {item.duration_ms != null
+                        ? `${item.cache_hit ? "缓存命中 · " : "处理耗时 "}${formatDuration(item.duration_ms)}`
+                        : item.status === "pending" || item.status === "processing"
+                          ? "等待耗时统计"
+                          : "历史任务未记录耗时"}
+                    </p>
+                  )}
                 </div>
               ))}
             </div>
@@ -259,7 +275,7 @@ export default function ImageTranslate({
           <div className="mt-3 overflow-x-auto">
             <table className="w-full text-sm">
               <thead><tr className="border-b border-line text-left text-xs text-muted">
-                <th className="pb-2 pr-4">状态</th><th className="pb-2 pr-4">进度</th><th className="pb-2 pr-4">时间</th><th className="pb-2">操作</th>
+                <th className="pb-2 pr-4">状态</th><th className="pb-2 pr-4">进度</th>{showTiming && <th className="pb-2 pr-4">耗时</th>}<th className="pb-2 pr-4">时间</th><th className="pb-2">操作</th>
               </tr></thead>
               <tbody>
                 {history.map((t) => (
@@ -270,6 +286,7 @@ export default function ImageTranslate({
                       {(t.review_count || 0) > 0 && <span className="text-amber-600"> ({t.review_count}需确认)</span>}
                       {t.failed_count > 0 && <span className="text-red-500"> ({t.failed_count}失败)</span>}
                     </td>
+                    {showTiming && <td className="py-2 pr-4 text-xs text-muted">{t.duration_ms != null ? formatDuration(t.duration_ms) : "未记录"}</td>}
                     <td className="py-2 pr-4 text-xs text-muted">{new Date(t.created_at).toLocaleString("zh-CN")}</td>
                     <td className="py-2">
                       <button onClick={() => viewTask(t.id)} className="mr-2 text-xs text-accent hover:underline">查看</button>
@@ -294,6 +311,18 @@ export default function ImageTranslate({
       )}
     </div>
   );
+}
+
+export function formatDuration(durationMs: number): string {
+  const safeMs = Math.max(0, Math.round(durationMs));
+  if (safeMs < 1000) return `${safeMs}毫秒`;
+  if (safeMs < 60_000) {
+    const seconds = safeMs / 1000;
+    return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}秒`;
+  }
+  const minutes = Math.floor(safeMs / 60_000);
+  const seconds = Math.round((safeMs % 60_000) / 1000);
+  return seconds > 0 ? `${minutes}分${seconds}秒` : `${minutes}分钟`;
 }
 
 /* ─── Compare Modal with Slider ─── */

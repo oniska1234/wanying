@@ -35,6 +35,7 @@ export async function GET(req: NextRequest) {
       done_count: t.doneCount,
       failed_count: t.failedCount,
       review_count: t.items.filter((item) => item.status === "review").length,
+      duration_ms: t.durationMs,
       created_at: t.createdAt.toISOString(),
     })),
     total,

@@ -88,6 +88,7 @@ class TaskStatus(BaseModel):
     results: list[dict] = []
     queue_position: int = 0
     estimated_wait_seconds: int = 0
+    duration_ms: int = 0
 
 
 def _cleanup_stale_temp_dirs() -> int:
@@ -469,6 +470,7 @@ async def get_task_status(task_id: str):
         done=task["done"],
         failed=task["failed"],
         results=task["results"],
+        duration_ms=task["duration_ms"],
         queue_position=task["queue_position"],
         estimated_wait_seconds=round(
             (
