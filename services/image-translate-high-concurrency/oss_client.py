@@ -77,6 +77,17 @@ class OSSClient:
         self._bucket.get_object_to_file(object_key, str(local_path))
         return local_path
 
+    def copy_object(self, source_key: str, destination_key: str) -> str:
+        """Copy an existing cached result to a task-owned output key."""
+        if not self._bucket:
+            raise RuntimeError("OSS not configured")
+        self._bucket.copy_object(
+            OSS_BUCKET_NAME,
+            source_key,
+            destination_key,
+        )
+        return destination_key
+
     def generate_signed_url(self, object_key: str, expires: int = 3600) -> str:
         """Generate a signed URL for temporary access (always HTTPS)."""
         if not self._bucket:

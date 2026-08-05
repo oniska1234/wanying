@@ -18,6 +18,7 @@ class FakeOSS:
         self.fail_download = fail_download
         self.fail_upload = fail_upload
         self.uploaded: list[str] = []
+        self.copied: list[tuple[str, str]] = []
 
     def download_file(self, key: str, target: Path) -> None:
         del key
@@ -31,6 +32,9 @@ class FakeOSS:
         self.assert_file(source)
         self.uploaded.append(key)
 
+    def copy_object(self, source_key: str, destination_key: str) -> None:
+        self.copied.append((source_key, destination_key))
+
     @staticmethod
     def assert_file(path: Path) -> None:
         if not path.is_file():
@@ -38,7 +42,11 @@ class FakeOSS:
 
 
 class FakePipeline:
+    def __init__(self) -> None:
+        self.calls = 0
+
     def process_image(self, source: Path, output: Path) -> dict:
+        self.calls += 1
         if not source.is_file():
             raise AssertionError("source was not downloaded")
         output.write_bytes(b"output")
@@ -106,6 +114,24 @@ class WorkerFaultTests(unittest.TestCase):
         self.assertEqual(task["done"], 1)
         self.assertEqual(len(fake_oss.uploaded), 1)
         self.assertFalse((main.TMP_DIR / item.task_id / str(item.id)).exists())
+
+    def test_identical_source_reuses_cached_result(self) -> None:
+        fake_oss = FakeOSS()
+        pipeline = FakePipeline()
+        main.oss = fake_oss
+
+        first = self.enqueue_and_claim("task-first")
+        main._process_queue_item(0, pipeline, first)
+        second = self.enqueue_and_claim("task-second")
+        main._process_queue_item(0, pipeline, second)
+
+        assert main.queue is not None
+        task = main.queue.load_task("task-second")
+        assert task is not None
+        self.assertEqual(task["status"], "done")
+        self.assertEqual(pipeline.calls, 1)
+        self.assertEqual(len(fake_oss.copied), 1)
+        self.assertTrue(task["results"][0]["cache_hit"])
 
     def test_download_failure_requeues_then_can_recover(self) -> None:
         item = self.enqueue_and_claim()

@@ -4,6 +4,8 @@ from __future__ import annotations
 import gc
 import logging
 import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -13,13 +15,21 @@ from config import MAX_OUTPUT_EDGE, OUTPUT_WIDTH, OUTPUT_HEIGHT, JPEG_QUALITY
 from translator import MalayTranslator
 from ocr_detector import (
     ResidualChineseDetector,
-    box_overlap_ratio,
     is_actionable_chinese_hit,
 )
 from enhancement import ImageQualityEnhancer
 from quality_gate import assess_layout_diagnostics
 
 LOGGER = logging.getLogger("image_translate.pipeline")
+
+
+@contextmanager
+def timed_stage(timings: dict[str, int], name: str):
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        timings[name] = round((time.monotonic() - started) * 1000)
 
 
 def is_small_product_label_hit(hit, image_size: tuple[int, int]) -> bool:
@@ -144,33 +154,57 @@ class ImagePipeline:
 
     def _process_image_locked(self, source_path: Path, output_path: Path) -> dict:
         """Process a single image. Returns a result dict."""
+        started = time.monotonic()
+        timings: dict[str, int] = {}
+
+        def finish(result: dict) -> dict:
+            timings["total"] = round((time.monotonic() - started) * 1000)
+            result["stage_durations_ms"] = dict(timings)
+            LOGGER.info(
+                "Pipeline timing %s: %s",
+                source_path.name,
+                " ".join(f"{name}={duration}ms" for name, duration in timings.items()),
+            )
+            return result
+
         try:
-            with Image.open(source_path) as opened:
-                edited = opened.copy().convert("RGB")
+            with timed_stage(timings, "decode"):
+                with Image.open(source_path) as opened:
+                    edited = opened.copy().convert("RGB")
 
             # Try Qwen-VL vision analysis first for layout-aware translation
             self.detector.last_layout_diagnostics = []
             self.detector.last_brand_boxes = []
             self.detector.last_watermark_diagnostics = []
             self.detector.last_remaining_hits = []
-            source_ocr_hints = self.detector.scan(edited, minimum_confidence=0.35)
+            with timed_stage(timings, "source_ocr"):
+                source_ocr_hints = self.detector.scan(
+                    edited, minimum_confidence=0.35,
+                )
             small_product_label_hits = tuple(
                 hit for hit in source_ocr_hints
                 if is_small_product_label_hit(hit, edited.size)
             )
-            vision_data = self.translator.vision_analyze_image(
-                source_path,
-                ocr_hints=[
-                    {"text": hit.text, "box": list(hit.box)}
-                    for hit in source_ocr_hints
-                ],
-            )
+            with timed_stage(timings, "vision"):
+                vision_data = self.translator.vision_analyze_image(
+                    source_path,
+                    ocr_hints=[
+                        {"text": hit.text, "box": list(hit.box)}
+                        for hit in source_ocr_hints
+                    ],
+                )
             vision_repaired = 0
             handled_boxes: tuple[tuple[int, int, int, int], ...] = ()
             if vision_data:
-                edited, vision_repaired, handled_boxes = self.detector.apply_vision_replacements(
-                    edited, vision_data, self.translator,
-                )
+                with timed_stage(timings, "vision_render"):
+                    edited, vision_repaired, handled_boxes = (
+                        self.detector.apply_vision_replacements(
+                            edited,
+                            vision_data,
+                            self.translator,
+                            ocr_hints=source_ocr_hints,
+                        )
+                    )
             unsafe_watermarks = [
                 item for item in self.detector.last_watermark_diagnostics
                 if item.get("unsafe")
@@ -180,18 +214,14 @@ class ImagePipeline:
                     "Quality gate rejected %s: watermark crosses foreground",
                     source_path.name,
                 )
-                return {
+                return finish({
                     "status": "failed",
                     "retryable": False,
                     "error": "商家水印覆盖商品主体，为避免损伤商品图已停止自动处理，请人工处理",
                     "quality_score": 0.0,
                     "quality_reasons": ["watermark_crosses_foreground"],
-                }
+                })
 
-            # Fallback brand removal runs after vision so faint OCR fragments
-            # remain available as coordinate anchors for complete watermarks.
-            source_brand = self.detector.remove_brands_and_verify(edited)
-            edited = source_brand.image
             layout_quality = assess_layout_diagnostics(
                 self.detector.last_layout_diagnostics,
                 image_size=edited.size,
@@ -202,95 +232,57 @@ class ImagePipeline:
                     source_path.name,
                     ",".join(layout_quality.reasons),
                 )
-                return {
+                return finish({
                     "status": "failed",
                     "retryable": False,
                     "error": "自动排版检测到译文区域越界、重叠或遮挡商品，请人工确认",
                     "quality_score": layout_quality.score,
                     "quality_reasons": list(layout_quality.reasons),
-                }
+                })
 
-            # OCR may still see remnants inside a vision-handled box. Erase
-            # those strokes, but never draw a second translation there.
-            if handled_boxes:
-                handled_residuals = [
-                    hit for hit in self.detector.scan(edited)
-                    if any(
-                        box_overlap_ratio(hit.box, box) >= 0.35
-                        for box in handled_boxes
-                    )
-                ]
-                self.detector.erase_hits(edited, handled_residuals)
-
-            source_residual = self.detector.repair_and_verify(
-                edited,
-                allow_repair=True,
-                translator=self.translator,
-                handled_boxes=handled_boxes,
-            )
+            # Reuse the original source OCR for the fallback cleanup. Vision-
+            # handled boxes are filtered out, while unmatched labels and brand
+            # copy retain their original source coordinates. Final verification
+            # is deferred to the exact public 800x800 artifact instead of
+            # rescanning several intermediate sizes.
+            with timed_stage(timings, "source_cleanup"):
+                source_residual = self.detector.repair_and_verify(
+                    edited,
+                    allow_repair=True,
+                    translator=self.translator,
+                    handled_boxes=handled_boxes,
+                    initial_hits=source_ocr_hints,
+                    max_repair_passes=1,
+                    verify_after_repair=False,
+                )
             unresolved_source_hits = tuple(
                 hit for hit in source_residual.remaining
                 if is_actionable_chinese_hit(hit)
             )
 
-            # Enhancement (only upscale small images, preserve aspect)
-            enhancement = self.enhancer.enhance(source_residual.image)
+            with timed_stage(timings, "enhance_resize"):
+                enhancement = self.enhancer.enhance(source_residual.image)
+                final = limit_size(enhancement.image)
+                final = trim_near_white_border(final)
+                final = fit_to_output_canvas(final)
 
-            # Limit output size (preserve aspect ratio, no forced square)
-            final = limit_size(enhancement.image)
-
-            # Scale handled regions when enhancement/limit_size changed image dimensions.
-            source_w, source_h = source_residual.image.size
-            final_w, final_h = final.size
-            scaled_handled_boxes = tuple(
-                (
-                    round(box[0] * final_w / source_w),
-                    round(box[1] * final_h / source_h),
-                    round(box[2] * final_w / source_w),
-                    round(box[3] * final_h / source_h),
+            # One repair pass plus one conditional verification pass on the
+            # exact downloadable artifact replaces the previous source/final/
+            # public scan chain. repair_and_verify.remaining already contains
+            # the last OCR result, so a separate final scan is unnecessary.
+            with timed_stage(timings, "public_quality"):
+                public_residual = self.detector.repair_and_verify(
+                    final,
+                    allow_repair=True,
+                    translator=self.translator,
+                    max_repair_passes=1,
+                    verify_after_repair=True,
                 )
-                for box in handled_boxes
-            )
+                final = public_residual.image
 
-            if scaled_handled_boxes:
-                handled_final_residuals = [
-                    hit for hit in self.detector.scan(final)
-                    if any(
-                        box_overlap_ratio(hit.box, box) >= 0.35
-                        for box in scaled_handled_boxes
-                    )
-                ]
-                self.detector.erase_hits(final, handled_final_residuals)
-
-            final_residual = self.detector.repair_and_verify(
-                final,
-                allow_repair=True,
-                translator=self.translator,
-                handled_boxes=scaled_handled_boxes,
-            )
-            final_brand = self.detector.remove_brands_and_verify(final_residual.image)
-            final = trim_near_white_border(final_brand.image)
-
-            # Verify and repair the exact public 800x800 artifact.  The old
-            # order checked a larger intermediate and then resized it, which
-            # let small/rotated package copy disappear from OCR telemetry while
-            # remaining visible to a person in the delivered file.
-            final = fit_to_output_canvas(final)
-            public_residual = self.detector.repair_and_verify(
-                final,
-                allow_repair=True,
-                translator=self.translator,
-            )
-            public_brand = self.detector.remove_brands_and_verify(public_residual.image)
-            final = public_brand.image
-
-            # A generated JPEG is not a successful translation if actionable
-            # Chinese remains after all three repair passes.  Mark it retryable
-            # so the durable queue can use its configured retry budget; Qwen
-            # and OCR occasionally resolve the same region on a later pass.
             remaining_chinese = tuple(
                 hit
-                for hit in self.detector.scan(final, minimum_confidence=0.35)
+                for hit in public_residual.remaining
                 if is_actionable_chinese_hit(hit)
             )
             if remaining_chinese:
@@ -303,31 +295,19 @@ class ImagePipeline:
                     for hit in remaining_chinese
                 ]
                 LOGGER.warning(
-                    "Quality gate rejected %s: %d Chinese regions remain",
+                    "Quality review flagged %s: %d Chinese regions remain",
                     source_path.name,
                     len(remaining_chinese),
                 )
-                return {
-                    "status": "failed",
-                    "retryable": True,
-                    "error": "译图仍存在未处理中文，系统将自动重试；多次失败后请人工确认",
-                    "quality_score": 0.0,
-                    "quality_reasons": ["residual_chinese"],
-                    "quality_details": {
-                        "remaining_regions": self.detector.last_remaining_hits,
-                    },
-                }
 
             repaired_count = (
                 vision_repaired
                 + len(source_residual.repaired)
-                + len(final_residual.repaired)
                 + len(public_residual.repaired)
             )
             removed_brand_count = (
-                len(source_brand.repaired)
-                + len(final_brand.repaired)
-                + len(public_brand.repaired)
+                len(source_residual.removed_brands)
+                + len(public_residual.removed_brands)
             )
             quality_reasons = list(layout_quality.reasons)
             if unresolved_source_hits:
@@ -342,23 +322,32 @@ class ImagePipeline:
                 # after resizing. Keep the artifact downloadable and require a
                 # human comparison instead of reporting a false clean success.
                 quality_reasons.append("small_product_label_requires_review")
+            if remaining_chinese:
+                # OCR/layout misses are deterministic for the same artifact.
+                # Preserve the usable output for comparison instead of blocking
+                # the queue with up to three identical full-image retries.
+                quality_reasons.append("residual_chinese")
             quality_reasons = list(dict.fromkeys(quality_reasons))
             needs_review = (
                 layout_quality.needs_review
                 or bool(unresolved_source_hits)
                 or bool(small_product_label_hits)
+                or bool(remaining_chinese)
             )
             quality_score = layout_quality.score
             if unresolved_source_hits:
                 quality_score = min(quality_score, 0.6)
             if small_product_label_hits:
                 quality_score = min(quality_score, 0.55)
+            if remaining_chinese:
+                quality_score = min(quality_score, 0.4)
 
             # Save output
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            save_high_quality_jpeg(final, output_path)
+            with timed_stage(timings, "encode"):
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                save_high_quality_jpeg(final, output_path)
 
-            return {
+            return finish({
                 "status": "success",
                 "translated": repaired_count > 0 or removed_brand_count > 0,
                 "repaired_phrases": repaired_count,
@@ -368,17 +357,21 @@ class ImagePipeline:
                 "needs_review": needs_review,
                 "quality_reasons": quality_reasons,
                 "review_message": (
-                    "源图艺术字或商品贴纸清理置信度不足，请对比确认"
-                    if needs_review else None
+                    "图片存在低置信度艺术字、商品贴纸或残留中文，请对比确认"
+                    if needs_review
+                    else None
                 ),
-            }
+                "quality_details": {
+                    "remaining_regions": self.detector.last_remaining_hits,
+                } if remaining_chinese else {},
+            })
         except Exception as exc:
             LOGGER.exception("Failed to process %s", source_path)
-            return {
+            return finish({
                 "status": "failed",
                 "retryable": False,
                 "error": "图片处理失败，请检查文件格式",
-            }
+            })
 
     def process_batch(
         self, input_paths: list[Path], output_dir: Path, progress_callback=None,

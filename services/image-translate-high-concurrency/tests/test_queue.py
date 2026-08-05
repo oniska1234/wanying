@@ -120,6 +120,7 @@ class DurableQueueTests(unittest.TestCase):
                 "output_key": "review.jpg",
                 "needs_review": True,
                 "quality_reasons": ["source_cleanup_low_confidence"],
+                "stage_durations_ms": {"source_ocr": 1200, "vision": 800},
             },
             duration_ms=10,
         )
@@ -138,6 +139,10 @@ class DurableQueueTests(unittest.TestCase):
         metrics = self.queue.metrics()
         self.assertEqual(metrics["review_items"], 1)
         self.assertEqual(metrics["failure_reasons"], {"residual_chinese": 1})
+        self.assertEqual(
+            metrics["stage_average_ms"],
+            {"source_ocr": 1200.0, "vision": 800.0},
+        )
 
     def test_capacity_and_per_user_limits_are_enforced(self) -> None:
         self.enqueue("task-a", "user-a", 2)

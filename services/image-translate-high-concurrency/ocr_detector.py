@@ -56,6 +56,7 @@ class ResidualResult:
     detected: tuple[ChineseHit, ...]
     repaired: tuple[ChineseHit, ...]
     remaining: tuple[ChineseHit, ...]
+    removed_brands: tuple[ChineseHit, ...] = ()
 
 
 def contains_chinese(text: str) -> bool:
@@ -970,9 +971,13 @@ class ResidualChineseDetector:
         self, image: Image.Image, *, allow_repair: bool,
         translator: MalayTranslator | None = None,
         handled_boxes: tuple[tuple[int, int, int, int], ...] = (),
+        initial_hits: tuple[ChineseHit, ...] | None = None,
+        max_repair_passes: int = 2,
+        verify_after_repair: bool = True,
     ) -> ResidualResult:
-        detected = self.scan(image)
+        detected = initial_hits if initial_hits is not None else self.scan(image)
         repaired: list[ChineseHit] = []
+        removed_brands: list[ChineseHit] = []
         edited = image.copy().convert("RGB")
         current_hits = tuple(
             hit for hit in detected
@@ -980,7 +985,7 @@ class ResidualChineseDetector:
         )
 
         if allow_repair:
-            for _pass in range(2):
+            for _pass in range(max(0, max_repair_passes)):
                 replacements = self._batch_translate_hits(
                     current_hits, translator, image_size=edited.size,
                 )
@@ -988,7 +993,16 @@ class ResidualChineseDetector:
                     break
                 for hit, _ in replacements:
                     repaired.append(hit)
+                removed_brands.extend(
+                    hit for hit, translation in replacements if not translation
+                )
                 self._apply_replacements(edited, replacements)
+                if not verify_after_repair:
+                    replaced = {hit for hit, _ in replacements}
+                    current_hits = tuple(
+                        hit for hit in current_hits if hit not in replaced
+                    )
+                    break
                 current_hits = tuple(
                     hit for hit in self.scan(edited)
                     if not is_box_handled(hit.box, handled_boxes)
@@ -997,6 +1011,7 @@ class ResidualChineseDetector:
         return ResidualResult(
             image=edited, detected=tuple(detected),
             repaired=tuple(repaired), remaining=current_hits,
+            removed_brands=tuple(removed_brands),
         )
 
     def _batch_translate_hits(
@@ -1061,9 +1076,10 @@ class ResidualChineseDetector:
                 if translation:
                     replacements.append((hit, translation))
                 else:
-                    result = translator.translate(hit.text)
-                    if result:
-                        replacements.append((hit, result))
+                    LOGGER.warning(
+                        "Deferred OCR region after batch translation miss text=%s",
+                        hit.text,
+                    )
 
         return replacements
 
@@ -1085,6 +1101,7 @@ class ResidualChineseDetector:
         return ResidualResult(
             image=edited, detected=tuple(brand_hits),
             repaired=tuple(brand_hits), remaining=remaining,
+            removed_brands=tuple(brand_hits),
         )
 
     def _apply_replacements(self, image: Image.Image, replacements: list[tuple[ChineseHit, str]]) -> None:
@@ -1117,6 +1134,8 @@ class ResidualChineseDetector:
         image: Image.Image,
         vision_data: list,
         translator: MalayTranslator,
+        *,
+        ocr_hints: tuple[ChineseHit, ...] | None = None,
     ) -> tuple[Image.Image, int, tuple[tuple[int, int, int, int], ...]]:
         """Apply translations from Qwen-VL vision analysis with layout-aware rendering.
 
@@ -1132,7 +1151,35 @@ class ResidualChineseDetector:
         watermark_regions: list[tuple[tuple[int, int, int, int], tuple[int, int, int]]] = []
         render_tasks: list[dict] = []
         handled_boxes: list[tuple[int, int, int, int]] = []
-        ocr_hints = self.scan(edited, minimum_confidence=0.35)
+        if ocr_hints is None:
+            ocr_hints = self.scan(edited, minimum_confidence=0.35)
+        prepared_translations: dict[int, str] = {}
+        pending_translations: dict[int, str] = {}
+        for index, item in enumerate(vision_data):
+            if not isinstance(item, dict):
+                continue
+            source_text = str(item.get("text", ""))
+            if (
+                not contains_chinese(source_text)
+                or str(item.get("kind", "")).lower() == "watermark"
+            ):
+                continue
+            validated = translator.validate_vision_candidate(
+                source_text,
+                str(item.get("translation", "")),
+            )
+            if validated:
+                prepared_translations[index] = validated
+            else:
+                pending_translations[index] = source_text
+        if pending_translations:
+            batch_results = translator.translate_batch(
+                list(dict.fromkeys(pending_translations.values())),
+            )
+            for index, source_text in pending_translations.items():
+                translated = batch_results.get(source_text)
+                if translated:
+                    prepared_translations[index] = translated
         LOGGER.info("Applying %d vision text regions", len(vision_data))
         img_w, img_h = edited.size
         vision_coordinate_scale = _infer_vision_coordinate_scale(
@@ -1145,7 +1192,7 @@ class ResidualChineseDetector:
             )
         foreground_mask: np.ndarray | None = None
 
-        for item in vision_data:
+        for item_index, item in enumerate(vision_data):
             try:
                 box = item.get("box", [])
                 if len(box) != 4:
@@ -1288,10 +1335,13 @@ class ResidualChineseDetector:
                 if source_is_brand:
                     translation = ""
                 else:
-                    translation = translator.validate_vision_translation(
-                        source_text,
-                        str(item.get("translation", "")),
-                    )
+                    translation = prepared_translations.get(item_index)
+                    if not translation:
+                        LOGGER.warning(
+                            "Deferred vision region with invalid translation text=%s",
+                            source_text,
+                        )
+                        continue
                 handled_boxes.append(vision_box)
 
                 color = item.get("color", None)

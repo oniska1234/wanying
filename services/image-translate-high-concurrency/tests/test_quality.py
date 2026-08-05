@@ -31,6 +31,47 @@ from brand_removal import BrandPolicy
 
 
 class RegionDeduplicationTests(unittest.TestCase):
+    def test_repair_can_reuse_initial_ocr_without_rescanning(self) -> None:
+        hit = ChineseHit(
+            text="产品信息", confidence=0.99, box=(10, 10, 110, 40),
+            polygon=((10, 10), (110, 10), (110, 40), (10, 40)),
+        )
+        detector = object.__new__(ResidualChineseDetector)
+        scan_calls = []
+        detector.scan = lambda *_args, **_kwargs: scan_calls.append(True) or ()
+        detector._batch_translate_hits = (
+            lambda hits, _translator, **_kwargs: [(hits[0], "Maklumat Produk")]
+        )
+        detector._apply_replacements = lambda *_args, **_kwargs: None
+
+        result = detector.repair_and_verify(
+            Image.new("RGB", (200, 100), "white"),
+            allow_repair=True,
+            initial_hits=(hit,),
+            max_repair_passes=1,
+            verify_after_repair=False,
+        )
+
+        self.assertEqual(scan_calls, [])
+        self.assertEqual(result.repaired, (hit,))
+        self.assertEqual(result.remaining, ())
+
+    def test_vision_render_reuses_supplied_ocr_hints(self) -> None:
+        detector = object.__new__(ResidualChineseDetector)
+        detector._brand_policy = BrandPolicy()
+        detector.scan = lambda *_args, **_kwargs: self.fail("unexpected OCR scan")
+
+        image, count, handled = detector.apply_vision_replacements(
+            Image.new("RGB", (200, 100), "white"),
+            [],
+            MalayTranslator(),
+            ocr_hints=(),
+        )
+
+        self.assertEqual(image.size, (200, 100))
+        self.assertEqual(count, 0)
+        self.assertEqual(handled, ())
+
     def test_compact_chinese_in_product_area_requires_review(self) -> None:
         hit = ChineseHit(
             text="烟花水", confidence=0.99, box=(120, 450, 180, 480),
@@ -111,6 +152,46 @@ class RegionDeduplicationTests(unittest.TestCase):
 
 
 class TranslationQualityTests(unittest.TestCase):
+    def test_batch_keeps_curated_terms_when_qwen_is_unavailable(self) -> None:
+        translator = MalayTranslator()
+        translator.qwen_disabled = True
+        self.assertEqual(
+            translator.translate_batch(["产品信息"]),
+            {"产品信息": "MAKLUMAT PRODUK"},
+        )
+
+    def test_ocr_batch_miss_does_not_start_serial_translation(self) -> None:
+        hit = ChineseHit(
+            text="神奇新品组合", confidence=0.99, box=(10, 10, 180, 50),
+            polygon=((10, 10), (180, 10), (180, 50), (10, 50)),
+        )
+
+        class StubTranslator:
+            @staticmethod
+            def translate_batch(_texts: list[str]) -> dict[str, str]:
+                return {}
+
+            @staticmethod
+            def translate(_text: str) -> str:
+                raise AssertionError("unexpected serial translation fallback")
+
+        detector = object.__new__(ResidualChineseDetector)
+        detector._brand_policy = BrandPolicy()
+        replacements = detector._batch_translate_hits(
+            (hit,), StubTranslator(), image_size=(800, 800),
+        )
+        self.assertEqual(replacements, [])
+
+    def test_failed_batch_does_not_fan_out_into_serial_qwen_calls(self) -> None:
+        translator = MalayTranslator()
+        translator.qwen_disabled = False
+        translator._translate_qwen_batch = lambda _text: None
+        translator._translate_qwen = lambda _text: self.fail(
+            "unexpected per-region Qwen fallback"
+        )
+
+        self.assertEqual(translator.translate_batch(["新款玩具", "产品尺寸"]), {})
+
     def test_high_confidence_short_product_label_is_translated(self) -> None:
         class StubTranslator:
             @staticmethod

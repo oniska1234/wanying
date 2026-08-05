@@ -7,7 +7,7 @@ replicas against separate copies of `tasks.db`.
 
 ## Runtime defaults
 
-- One image worker (`IMAGE_TRANSLATE_WORKERS=1`).
+- Two image workers (`IMAGE_TRANSLATE_WORKERS=2`).
 - At most 120 queued/processing images.
 - At most three active tasks per user.
 - Three attempts for retryable storage or unexpected failures.
@@ -17,9 +17,11 @@ replicas against separate copies of `tasks.db`.
 - WAL mode, transactional claims, task-level ordering within user-level fair
   scheduling, and startup recovery of interrupted items.
 
-The current 2-core, 3.5 GB host must stay at one worker until a measured load
-test proves that a second OCR/vision pipeline fits without memory pressure.
-Horizontal scale requires moving the queue to PostgreSQL or Redis first.
+The current 2-core, 3.5 GB host passed a two-worker load test with two real
+1920px production images: peak process RSS was about 889 MB and host available
+memory stayed near 979 MB while the old services were also resident. Horizontal
+scale beyond two workers requires another capacity test; multiple service
+replicas require moving the queue to PostgreSQL or Redis first.
 
 ## Quality behavior
 
@@ -32,8 +34,11 @@ Horizontal scale requires moving the queue to PostgreSQL or Redis first.
 - Unsafe translated-region overlap and out-of-bounds layout fail closed.
 - Low-confidence source cleanup continues through downstream repair and is
   emitted as a downloadable `needs_review` result only when final OCR is clean.
-- Residual Chinese is checked on the exact 800x800 public artifact and consumes
-  the durable retry budget before becoming a terminal failure.
+- Residual Chinese is checked on the exact 800x800 public artifact and emitted
+  as a downloadable `needs_review` result. Deterministic OCR/layout findings do
+  not consume the full-image retry budget.
+- Exact duplicate images reuse a versioned SHA-256 result cache and copy the
+  cached artifact into the new task-owned OSS prefix.
 - Seller watermarks that cross detected product foreground are rejected with a
   manual-processing reason. Classical inpainting is intentionally not used on
   these regions.
@@ -43,8 +48,8 @@ Horizontal scale requires moving the queue to PostgreSQL or Redis first.
 - `GET /health` reports worker readiness, queue depth, processing count, and
   OSS availability.
 - `GET /metrics` exposes queue depth, processing count, retries, average and P95
-  duration, review outputs, terminal failures grouped by quality reason, and
-  oldest pending age in Prometheus format.
+  duration, per-stage averages, cache hits, review outputs, terminal failures
+  grouped by quality reason, and oldest pending age in Prometheus format.
 - `GET /task/{task_id}` includes queue position and estimated wait time.
 
 Alert when any of the following persists:

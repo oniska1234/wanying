@@ -359,8 +359,8 @@ class MalayTranslator:
         self.cache[source] = translated
         return translated
 
-    def validate_vision_translation(self, source_text: str, candidate: str) -> str | None:
-        """Validate vision output through the same rules as OCR translations."""
+    def validate_vision_candidate(self, source_text: str, candidate: str) -> str | None:
+        """Validate vision output without starting another network request."""
         source = re.sub(r"\s+", " ", source_text).strip()
         if not source:
             return None
@@ -379,11 +379,16 @@ class MalayTranslator:
             if not issues:
                 self.cache[source] = polished
                 return polished
-        return self.translate(source)
+        return None
+
+    def validate_vision_translation(self, source_text: str, candidate: str) -> str | None:
+        """Validate vision output, retaining the legacy single-item fallback."""
+        validated = self.validate_vision_candidate(source_text, candidate)
+        return validated if validated is not None else self.translate(source_text)
 
     def translate_batch(self, texts: list[str]) -> dict[str, str]:
         """Batch translate multiple texts via single Qwen call. Returns {text: translation}."""
-        if not texts or self.qwen_disabled:
+        if not texts:
             return {}
         results: dict[str, str] = {}
         to_translate: list[str] = []
@@ -399,7 +404,7 @@ class MalayTranslator:
             else:
                 to_translate.append(source)
 
-        if not to_translate:
+        if not to_translate or self.qwen_disabled:
             return results
 
         # Batch via Qwen (max 20 per call to stay within token limits)
@@ -417,15 +422,13 @@ class MalayTranslator:
                             self.cache[t] = candidate
                             self.qwen_count += 1
             else:
-                # Fallback: translate individually
-                for t in batch:
-                    r = self._translate_qwen(t)
-                    if r:
-                        candidate = polish_malaysia_ecommerce(r, source_text=t)
-                        if not malay_quality_issues(candidate, source_text=t):
-                            results[t] = candidate
-                            self.cache[t] = candidate
-                            self.qwen_count += 1
+                # Do not turn one failed batch request into as many sequential
+                # 30-second Qwen calls as there are OCR regions. The caller can
+                # preserve unresolved source copy for the final review path.
+                LOGGER.warning(
+                    "Qwen batch returned no usable result for %d text regions",
+                    len(batch),
+                )
         return results
 
 

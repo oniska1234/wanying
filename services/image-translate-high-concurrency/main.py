@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import logging
 import shutil
 import threading
@@ -21,6 +22,7 @@ from config import (
     MAX_JOB_ATTEMPTS,
     MAX_QUEUED_IMAGES,
     OSS_PREFIX,
+    PIPELINE_CACHE_VERSION,
     QUEUE_POLL_SECONDS,
     RETRY_BASE_SECONDS,
     SERVICE_DIR,
@@ -118,6 +120,36 @@ def _process_queue_item(worker_id: int, pipeline: ImagePipeline, item: QueueItem
         except Exception as exc:
             raise ConnectionError("文件下载失败") from exc
 
+        source_hash = hashlib.sha256(local_path.read_bytes()).hexdigest()
+        output_key = f"{OSS_PREFIX}/{item.user_id}/{item.task_id}/output/{out_path.name}"
+        cached = queue.load_cached_result(source_hash, PIPELINE_CACHE_VERSION)
+        if cached:
+            try:
+                oss.copy_object(cached["output_key"], output_key)
+                duration_ms = round((time.monotonic() - started) * 1000)
+                cached_result = {
+                    **cached["result"],
+                    "output_key": output_key,
+                    "cache_hit": True,
+                    "attempts": item.attempts,
+                    "duration_ms": duration_ms,
+                }
+                queue.complete_item(item, cached_result, duration_ms=duration_ms)
+                LOGGER.info(
+                    "Worker %d completed cached item %d task %s in %dms",
+                    worker_id,
+                    item.id,
+                    item.task_id,
+                    duration_ms,
+                )
+                return
+            except Exception as exc:
+                LOGGER.warning(
+                    "Cached result unavailable for item %d, processing normally: %s",
+                    item.id,
+                    exc,
+                )
+
         result = pipeline.process_image(local_path, out_path)
         if result.get("status") != "success":
             retryable = bool(result.get("retryable", False))
@@ -133,6 +165,7 @@ def _process_queue_item(worker_id: int, pipeline: ImagePipeline, item: QueueItem
                     "quality_score": result.get("quality_score", 0.0),
                     "quality_reasons": result.get("quality_reasons", []),
                     "quality_details": result.get("quality_details", {}),
+                    "stage_durations_ms": result.get("stage_durations_ms", {}),
                 },
             )
             LOGGER.warning(
@@ -144,29 +177,37 @@ def _process_queue_item(worker_id: int, pipeline: ImagePipeline, item: QueueItem
             )
             return
 
-        output_key = f"{OSS_PREFIX}/{item.user_id}/{item.task_id}/output/{out_path.name}"
         try:
             oss.upload_file(out_path, output_key)
         except Exception as exc:
             raise ConnectionError("结果上传失败，请重试") from exc
 
         duration_ms = round((time.monotonic() - started) * 1000)
-        queue.complete_item(
-            item,
-            {
-                "output_key": output_key,
-                "repaired": result.get("repaired_phrases", 0),
-                "brands_removed": result.get("removed_brands", 0),
-                "enhanced": result.get("enhanced", False),
-                "quality_score": result.get("quality_score", 1.0),
-                "needs_review": result.get("needs_review", False),
-                "quality_reasons": result.get("quality_reasons", []),
-                "review_message": result.get("review_message"),
-                "attempts": item.attempts,
-                "duration_ms": duration_ms,
-            },
-            duration_ms=duration_ms,
-        )
+        result_payload = {
+            "output_key": output_key,
+            "repaired": result.get("repaired_phrases", 0),
+            "brands_removed": result.get("removed_brands", 0),
+            "enhanced": result.get("enhanced", False),
+            "quality_score": result.get("quality_score", 1.0),
+            "needs_review": result.get("needs_review", False),
+            "quality_reasons": result.get("quality_reasons", []),
+            "quality_details": result.get("quality_details", {}),
+            "review_message": result.get("review_message"),
+            "stage_durations_ms": result.get("stage_durations_ms", {}),
+            "cache_hit": False,
+            "attempts": item.attempts,
+            "duration_ms": duration_ms,
+        }
+        queue.complete_item(item, result_payload, duration_ms=duration_ms)
+        try:
+            queue.store_cached_result(
+                source_hash,
+                PIPELINE_CACHE_VERSION,
+                output_key,
+                result_payload,
+            )
+        except Exception:
+            LOGGER.exception("Failed to store result cache for item %d", item.id)
         LOGGER.info(
             "Worker %d completed item %d task %s in %dms",
             worker_id,
@@ -344,6 +385,9 @@ async def metrics():
         "# HELP image_translate_review_items_total Successful outputs requiring manual review.",
         "# TYPE image_translate_review_items_total gauge",
         f"image_translate_review_items_total {snapshot['review_items']}",
+        "# HELP image_translate_cache_hits_total Images served from the result cache.",
+        "# TYPE image_translate_cache_hits_total counter",
+        f"image_translate_cache_hits_total {snapshot.get('cache_hits', 0)}",
         "# HELP image_translate_oldest_pending_seconds Age of the oldest queued image.",
         "# TYPE image_translate_oldest_pending_seconds gauge",
         f"image_translate_oldest_pending_seconds {snapshot['oldest_pending_seconds']}",
@@ -354,6 +398,15 @@ async def metrics():
         safe_reason = str(reason).replace("\\", "_").replace('"', "_")
         lines.append(
             f'image_translate_failed_items_by_reason{{reason="{safe_reason}"}} {count}'
+        )
+    lines.extend([
+        "# HELP image_translate_stage_duration_ms Average pipeline stage duration.",
+        "# TYPE image_translate_stage_duration_ms gauge",
+    ])
+    for stage, duration in sorted(snapshot.get("stage_average_ms", {}).items()):
+        safe_stage = str(stage).replace("\\", "_").replace('"', "_")
+        lines.append(
+            f'image_translate_stage_duration_ms{{stage="{safe_stage}"}} {duration}'
         )
     return "\n".join(lines) + "\n"
 

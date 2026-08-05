@@ -69,15 +69,19 @@ OSS_PREFIX = os.environ.get(
     "IMAGE_TRANSLATE_OSS_PREFIX",
     "image-translate",
 ).strip().strip("/") or "image-translate"
+PIPELINE_CACHE_VERSION = os.environ.get(
+    "IMAGE_TRANSLATE_PIPELINE_CACHE_VERSION",
+    "latency-v1",
+).strip() or "latency-v1"
 
 # Processing limits
 MAX_IMAGES_PER_TASK = 50
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
-# Durable worker queue. One worker is the safe default for the current
-# 2-core/3.5GB host; the queue can be drained by additional processes after a
-# measured capacity upgrade.
-WORKER_COUNT = _env_int("IMAGE_TRANSLATE_WORKERS", 1, minimum=1, maximum=8)
+# Two workers were validated on the current 2-core/3.5GB host with two real
+# 1920px production images. Keep a single service replica because SQLite owns
+# durable dispatch; increase beyond two only after another capacity test.
+WORKER_COUNT = _env_int("IMAGE_TRANSLATE_WORKERS", 2, minimum=1, maximum=8)
 MAX_QUEUED_IMAGES = _env_int(
     "IMAGE_TRANSLATE_MAX_QUEUED_IMAGES", 120, minimum=20, maximum=10000,
 )

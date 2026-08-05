@@ -104,6 +104,20 @@ class DurableQueue:
                 "CREATE INDEX IF NOT EXISTS tasks_user_status "
                 "ON tasks(user_id, status, created_at)"
             )
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS result_cache (
+                    source_hash TEXT NOT NULL,
+                    pipeline_version TEXT NOT NULL,
+                    output_key TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(source_hash, pipeline_version)
+                )
+            """)
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS result_cache_updated "
+                "ON result_cache(updated_at)"
+            )
             now = time.time()
             queue_columns = self._columns(connection, "queue_items")
             if "enqueued_at" not in queue_columns:
@@ -340,6 +354,56 @@ class DurableQueue:
             self._refresh_task(connection, item.task_id, now)
             connection.commit()
 
+    def load_cached_result(
+        self, source_hash: str, pipeline_version: str,
+    ) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT output_key, result FROM result_cache
+                   WHERE source_hash = ? AND pipeline_version = ?""",
+                (source_hash, pipeline_version),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["result"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return {"output_key": str(row["output_key"]), "result": payload}
+
+    def store_cached_result(
+        self,
+        source_hash: str,
+        pipeline_version: str,
+        output_key: str,
+        result: dict,
+    ) -> None:
+        now = time.time()
+        with self._write_lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO result_cache
+                   (source_hash, pipeline_version, output_key, result, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(source_hash, pipeline_version) DO UPDATE SET
+                     output_key = excluded.output_key,
+                     result = excluded.result,
+                     updated_at = excluded.updated_at""",
+                (
+                    source_hash,
+                    pipeline_version,
+                    output_key,
+                    json.dumps(result, ensure_ascii=False),
+                    now,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM result_cache WHERE updated_at < ?",
+                (now - 90 * 24 * 60 * 60,),
+            )
+            connection.commit()
+
     def fail_or_retry_item(
         self,
         item: QueueItem,
@@ -450,7 +514,9 @@ class DurableQueue:
             ).fetchall()
 
         review_items = 0
+        cache_hits = 0
         failure_reasons: dict[str, int] = {}
+        stage_samples: dict[str, list[int]] = {}
         for row in terminal_results:
             try:
                 payload = json.loads(row["result"] or "{}")
@@ -458,6 +524,12 @@ class DurableQueue:
                 continue
             if row["status"] == "success" and payload.get("needs_review"):
                 review_items += 1
+            if row["status"] == "success":
+                if payload.get("cache_hit"):
+                    cache_hits += 1
+                for stage, duration in (payload.get("stage_durations_ms") or {}).items():
+                    if isinstance(duration, (int, float)) and duration >= 0:
+                        stage_samples.setdefault(str(stage), []).append(round(duration))
             if row["status"] == "failed":
                 reasons = payload.get("quality_reasons") or ["unclassified"]
                 for reason in reasons:
@@ -485,6 +557,12 @@ class DurableQueue:
             "active_tasks": task_counts.get("pending", 0) + task_counts.get("processing", 0),
             "failed_items": item_counts.get("failed", 0),
             "review_items": review_items,
+            "cache_hits": cache_hits,
+            "stage_average_ms": {
+                stage: round(sum(values) / len(values), 1)
+                for stage, values in sorted(stage_samples.items())
+                if values
+            },
             "failure_reasons": failure_reasons,
             "oldest_pending_seconds": round(
                 max(0.0, time.time() - float(oldest_enqueued_at)), 1
