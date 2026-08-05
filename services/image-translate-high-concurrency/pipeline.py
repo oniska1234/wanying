@@ -46,6 +46,23 @@ def is_small_product_label_hit(hit, image_size: tuple[int, int]) -> bool:
     )
 
 
+def should_request_manual_review(
+    *,
+    layout_needs_review: bool,
+    has_unresolved_source: bool,
+    has_small_product_label: bool,
+    has_remaining_chinese: bool,
+    has_seller_watermark: bool,
+) -> bool:
+    detected_review_risk = (
+        layout_needs_review
+        or has_unresolved_source
+        or has_small_product_label
+        or has_remaining_chinese
+    )
+    return detected_review_risk and not has_seller_watermark
+
+
 @dataclass
 class ProcessingSummary:
     discovered: int = 0
@@ -205,22 +222,17 @@ class ImagePipeline:
                             ocr_hints=source_ocr_hints,
                         )
                     )
+            detected_watermarks = list(self.detector.last_watermark_diagnostics)
             unsafe_watermarks = [
                 item for item in self.detector.last_watermark_diagnostics
                 if item.get("unsafe")
             ]
             if unsafe_watermarks:
                 LOGGER.warning(
-                    "Quality gate rejected %s: watermark crosses foreground",
+                    "Preserving %d foreground-crossing watermark regions in %s and continuing",
+                    len(unsafe_watermarks),
                     source_path.name,
                 )
-                return finish({
-                    "status": "failed",
-                    "retryable": False,
-                    "error": "商家水印覆盖商品主体，为避免损伤商品图已停止自动处理，请人工处理",
-                    "quality_score": 0.0,
-                    "quality_reasons": ["watermark_crosses_foreground"],
-                })
 
             layout_quality = assess_layout_diagnostics(
                 self.detector.last_layout_diagnostics,
@@ -277,6 +289,11 @@ class ImagePipeline:
                     translator=self.translator,
                     max_repair_passes=1,
                     verify_after_repair=True,
+                    # The dedicated watermark pass has already removed what it
+                    # can safely handle or preserved the risky area. Keep brand
+                    # regions out of the generic final OCR repair while still
+                    # translating all other actionable Chinese copy.
+                    preserve_brand_regions=bool(detected_watermarks),
                 )
                 final = public_residual.image
 
@@ -310,6 +327,10 @@ class ImagePipeline:
                 + len(public_residual.removed_brands)
             )
             quality_reasons = list(layout_quality.reasons)
+            if unsafe_watermarks:
+                quality_reasons.append("watermark_preserved_foreground")
+            elif detected_watermarks:
+                quality_reasons.append("watermark_processed")
             if unresolved_source_hits:
                 # The final OCR is clean, but source-scale OCR had ambiguous
                 # product-area fragments that could not be translated safely.
@@ -328,11 +349,15 @@ class ImagePipeline:
                 # the queue with up to three identical full-image retries.
                 quality_reasons.append("residual_chinese")
             quality_reasons = list(dict.fromkeys(quality_reasons))
-            needs_review = (
-                layout_quality.needs_review
-                or bool(unresolved_source_hits)
-                or bool(small_product_label_hits)
-                or bool(remaining_chinese)
+            # Seller-watermark images must be delivered as normal successes.
+            # Unsafe regions stay untouched to protect the product; diagnostic
+            # reasons remain available for operations monitoring only.
+            needs_review = should_request_manual_review(
+                layout_needs_review=layout_quality.needs_review,
+                has_unresolved_source=bool(unresolved_source_hits),
+                has_small_product_label=bool(small_product_label_hits),
+                has_remaining_chinese=bool(remaining_chinese),
+                has_seller_watermark=bool(detected_watermarks),
             )
             quality_score = layout_quality.score
             if unresolved_source_hits:
@@ -346,6 +371,12 @@ class ImagePipeline:
             with timed_stage(timings, "encode"):
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 save_high_quality_jpeg(final, output_path)
+
+            quality_details = {}
+            if remaining_chinese:
+                quality_details["remaining_regions"] = self.detector.last_remaining_hits
+            if detected_watermarks:
+                quality_details["watermark_regions"] = detected_watermarks
 
             return finish({
                 "status": "success",
@@ -361,9 +392,7 @@ class ImagePipeline:
                     if needs_review
                     else None
                 ),
-                "quality_details": {
-                    "remaining_regions": self.detector.last_remaining_hits,
-                } if remaining_chinese else {},
+                "quality_details": quality_details,
             })
         except Exception as exc:
             LOGGER.exception("Failed to process %s", source_path)

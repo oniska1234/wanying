@@ -26,7 +26,7 @@ from config import FONT_REG
 from translator import MalayTranslator
 from layout_planner import plan_vertical_columns
 from quality_gate import assess_layout_diagnostics
-from pipeline import is_small_product_label_hit
+from pipeline import is_small_product_label_hit, should_request_manual_review
 from brand_removal import BrandPolicy
 
 
@@ -54,6 +54,40 @@ class RegionDeduplicationTests(unittest.TestCase):
 
         self.assertEqual(scan_calls, [])
         self.assertEqual(result.repaired, (hit,))
+        self.assertEqual(result.remaining, ())
+
+    def test_final_repair_preserves_brand_regions_but_translates_other_copy(self) -> None:
+        watermark = ChineseHit(
+            text="深圳某某有限公司", confidence=0.99, box=(20, 20, 180, 50),
+            polygon=((20, 20), (180, 20), (180, 50), (20, 50)),
+        )
+        product_copy = ChineseHit(
+            text="产品信息", confidence=0.99, box=(20, 70, 180, 100),
+            polygon=((20, 70), (180, 70), (180, 100), (20, 100)),
+        )
+        detector = object.__new__(ResidualChineseDetector)
+        detector._brand_policy = BrandPolicy()
+        detector.scan = lambda *_args, **_kwargs: ()
+        translated_hits = []
+
+        def translate(hits, _translator, **_kwargs):
+            translated_hits.extend(hits)
+            return [(hit, "Maklumat Produk") for hit in hits]
+
+        detector._batch_translate_hits = translate
+        detector._apply_replacements = lambda *_args, **_kwargs: None
+
+        result = detector.repair_and_verify(
+            Image.new("RGB", (200, 120), "white"),
+            allow_repair=True,
+            initial_hits=(watermark, product_copy),
+            max_repair_passes=1,
+            verify_after_repair=False,
+            preserve_brand_regions=True,
+        )
+
+        self.assertEqual(translated_hits, [product_copy])
+        self.assertEqual(result.repaired, (product_copy,))
         self.assertEqual(result.remaining, ())
 
     def test_vision_render_reuses_supplied_ocr_hints(self) -> None:
@@ -85,6 +119,24 @@ class RegionDeduplicationTests(unittest.TestCase):
             polygon=((80, 80), (720, 80), (720, 180), (80, 180)),
         )
         self.assertFalse(is_small_product_label_hit(hit, (800, 800)))
+
+    def test_seller_watermark_result_does_not_request_manual_review(self) -> None:
+        self.assertFalse(should_request_manual_review(
+            layout_needs_review=False,
+            has_unresolved_source=True,
+            has_small_product_label=True,
+            has_remaining_chinese=False,
+            has_seller_watermark=True,
+        ))
+
+    def test_non_watermark_quality_risk_still_requests_review(self) -> None:
+        self.assertTrue(should_request_manual_review(
+            layout_needs_review=False,
+            has_unresolved_source=True,
+            has_small_product_label=False,
+            has_remaining_chinese=False,
+            has_seller_watermark=False,
+        ))
 
     def test_overlap_uses_smaller_region_as_denominator(self) -> None:
         self.assertEqual(box_overlap_ratio((10, 10, 20, 20), (0, 0, 30, 30)), 1.0)

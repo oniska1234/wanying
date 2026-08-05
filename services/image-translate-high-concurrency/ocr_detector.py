@@ -974,15 +974,25 @@ class ResidualChineseDetector:
         initial_hits: tuple[ChineseHit, ...] | None = None,
         max_repair_passes: int = 2,
         verify_after_repair: bool = True,
+        preserve_brand_regions: bool = False,
     ) -> ResidualResult:
         detected = initial_hits if initial_hits is not None else self.scan(image)
         repaired: list[ChineseHit] = []
         removed_brands: list[ChineseHit] = []
         edited = image.copy().convert("RGB")
-        current_hits = tuple(
-            hit for hit in detected
-            if not is_box_handled(hit.box, handled_boxes)
-        )
+        def should_process(hit: ChineseHit) -> bool:
+            if is_box_handled(hit.box, handled_boxes):
+                return False
+            if preserve_brand_regions and self._brand_policy.is_brand_text(
+                hit.text,
+                confidence=hit.confidence,
+                box=hit.box,
+                image_size=edited.size,
+            ):
+                return False
+            return True
+
+        current_hits = tuple(hit for hit in detected if should_process(hit))
 
         if allow_repair:
             for _pass in range(max(0, max_repair_passes)):
@@ -1004,8 +1014,7 @@ class ResidualChineseDetector:
                     )
                     break
                 current_hits = tuple(
-                    hit for hit in self.scan(edited)
-                    if not is_box_handled(hit.box, handled_boxes)
+                    hit for hit in self.scan(edited) if should_process(hit)
                 )
 
         return ResidualResult(
