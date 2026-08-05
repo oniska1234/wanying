@@ -50,6 +50,19 @@ class FakePipeline:
         }
 
 
+class FakeResidualPipeline:
+    def process_image(self, source: Path, output: Path) -> dict:
+        del source, output
+        return {
+            "status": "failed",
+            "retryable": True,
+            "error": "译图仍存在未处理中文，系统将自动重试",
+            "quality_score": 0.0,
+            "quality_reasons": ["residual_chinese"],
+            "quality_details": {"remaining_regions": [{"text": "中文"}]},
+        }
+
+
 class WorkerFaultTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -117,6 +130,21 @@ class WorkerFaultTests(unittest.TestCase):
         assert task is not None
         self.assertEqual(task["status"], "pending")
         self.assertEqual(task["done"], 0)
+
+    def test_residual_chinese_uses_durable_retry_budget(self) -> None:
+        item = self.enqueue_and_claim()
+        main.oss = FakeOSS()
+        main._process_queue_item(0, FakeResidualPipeline(), item)
+
+        assert main.queue is not None
+        task = main.queue.load_task(item.task_id)
+        assert task is not None
+        self.assertEqual(task["status"], "pending")
+        self.assertEqual(task["done"], 0)
+        self.assertEqual(task["failed"], 0)
+        resumed = main.queue.claim_next_item(now=time.time() + 1)
+        assert resumed is not None
+        self.assertEqual(resumed.attempts, 2)
 
     def test_api_contract_accepts_and_reports_durable_task(self) -> None:
         main._ready_workers.add(0)

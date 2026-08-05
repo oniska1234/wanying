@@ -132,6 +132,7 @@ def _process_queue_item(worker_id: int, pipeline: ImagePipeline, item: QueueItem
                 details={
                     "quality_score": result.get("quality_score", 0.0),
                     "quality_reasons": result.get("quality_reasons", []),
+                    "quality_details": result.get("quality_details", {}),
                 },
             )
             LOGGER.warning(
@@ -160,6 +161,7 @@ def _process_queue_item(worker_id: int, pipeline: ImagePipeline, item: QueueItem
                 "quality_score": result.get("quality_score", 1.0),
                 "needs_review": result.get("needs_review", False),
                 "quality_reasons": result.get("quality_reasons", []),
+                "review_message": result.get("review_message"),
                 "attempts": item.attempts,
                 "duration_ms": duration_ms,
             },
@@ -339,10 +341,20 @@ async def metrics():
         "# HELP image_translate_failed_items_total Terminally failed images.",
         "# TYPE image_translate_failed_items_total gauge",
         f"image_translate_failed_items_total {snapshot['failed_items']}",
+        "# HELP image_translate_review_items_total Successful outputs requiring manual review.",
+        "# TYPE image_translate_review_items_total gauge",
+        f"image_translate_review_items_total {snapshot['review_items']}",
         "# HELP image_translate_oldest_pending_seconds Age of the oldest queued image.",
         "# TYPE image_translate_oldest_pending_seconds gauge",
         f"image_translate_oldest_pending_seconds {snapshot['oldest_pending_seconds']}",
+        "# HELP image_translate_failed_items_by_reason Terminal failures grouped by quality reason.",
+        "# TYPE image_translate_failed_items_by_reason gauge",
     ]
+    for reason, count in sorted(snapshot["failure_reasons"].items()):
+        safe_reason = str(reason).replace("\\", "_").replace('"', "_")
+        lines.append(
+            f'image_translate_failed_items_by_reason{{reason="{safe_reason}"}} {count}'
+        )
     return "\n".join(lines) + "\n"
 
 

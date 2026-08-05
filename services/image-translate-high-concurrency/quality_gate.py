@@ -94,15 +94,20 @@ def assess_layout_diagnostics(
     if max_target_overlap > 0.35:
         reasons.append("translated_regions_overlap")
 
+    # A conservative source-cleanup attempt can decline a stylized headline
+    # even when the translated layout itself is safe.  Treat that signal as a
+    # review condition and let the downstream OCR repair/final-artifact gate
+    # decide whether Chinese actually remains.  It must not short-circuit the
+    # only recovery stages available to the image.
     severe = (
         invalid_box
-        or cleanup_failed
         or max_overlap > 0.38
         or min_confidence < 0.18
         or max_target_overlap > 0.35
     )
     needs_review = (
         severe
+        or cleanup_failed
         or max_overlap > 0.20
         or min_confidence < 0.42
         or max_target_overlap > 0.18
@@ -111,6 +116,10 @@ def assess_layout_diagnostics(
         0.0,
         min(1.0, min_confidence * (1.0 - max_overlap) * (1.0 - max_target_overlap)),
     )
+    if cleanup_failed:
+        # Keep telemetry consistent with the review decision.  Previously a
+        # cleanup failure was marked severe while still reporting 1.0.
+        score = min(score, 0.7)
     return LayoutQuality(
         score=round(score, 4),
         severe=severe,

@@ -2,9 +2,8 @@ import OSS from "ali-oss";
 
 let client: OSS | null = null;
 
-// The application server is in Shenzhen while this bucket is in Shanghai.
-// Cross-region PUT requests occasionally exceed ali-oss's 60 second default,
-// especially when several images are uploaded at the same time.
+// Keep an extended timeout/retry budget for weak client links and transient
+// OSS errors even though production storage now lives in the same region.
 const OSS_REQUEST_TIMEOUT_MS = 180_000;
 const OSS_RETRY_MAX = 2;
 
@@ -14,11 +13,11 @@ export function getOSSClient(): OSS {
     // does not currently declare the field. Keeping the config in a variable
     // avoids losing the supported runtime option to an unnecessary type cast.
     const options = {
-      region: "oss-cn-shanghai",
+      region: process.env.OSS_REGION || "oss-cn-shenzhen",
       secure: true,
       accessKeyId: process.env.OSS_ACCESS_KEY_ID || "",
       accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET || "",
-      bucket: process.env.OSS_BUCKET || "openclaw-webste-stock",
+      bucket: process.env.OSS_BUCKET || "transfer-pic",
       timeout: OSS_REQUEST_TIMEOUT_MS,
       retryMax: OSS_RETRY_MAX,
     };

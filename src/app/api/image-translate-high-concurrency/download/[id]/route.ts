@@ -18,7 +18,11 @@ export async function GET(req: NextRequest, { params }: Props) {
 
   const task = await prisma.imageTranslateHighTask.findFirst({
     where: { id, userId: session.user.id },
-    include: { items: { where: { status: "success", outputKey: { not: null } } } },
+    include: {
+      items: {
+        where: { status: { in: ["success", "review"] }, outputKey: { not: null } },
+      },
+    },
   });
   if (!task) {
     return NextResponse.json({ error: "任务不存在" }, { status: 404 });

@@ -22,6 +22,7 @@ export async function GET(req: NextRequest) {
       orderBy: { createdAt: "desc" },
       skip: (page - 1) * pageSize,
       take: pageSize,
+      include: { items: { select: { status: true } } },
     }),
     prisma.imageTranslateHighTask.count({ where: { userId: session.user.id } }),
   ]);
@@ -33,6 +34,7 @@ export async function GET(req: NextRequest) {
       total_count: t.totalCount,
       done_count: t.doneCount,
       failed_count: t.failedCount,
+      review_count: t.items.filter((item) => item.status === "review").length,
       created_at: t.createdAt.toISOString(),
     })),
     total,

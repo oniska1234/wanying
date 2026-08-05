@@ -5,11 +5,11 @@ let client: OSS | null = null;
 export function getOSSClient(): OSS {
   if (!client) {
     client = new OSS({
-      region: "oss-cn-shanghai",
+      region: process.env.OSS_REGION || "oss-cn-shenzhen",
       secure: true,
       accessKeyId: process.env.OSS_ACCESS_KEY_ID || "",
       accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET || "",
-      bucket: process.env.OSS_BUCKET || "openclaw-webste-stock",
+      bucket: process.env.OSS_BUCKET || "transfer-pic",
     });
   }
   return client;

@@ -22,6 +22,20 @@ from quality_gate import assess_layout_diagnostics
 LOGGER = logging.getLogger("image_translate.pipeline")
 
 
+def is_small_product_label_hit(hit, image_size: tuple[int, int]) -> bool:
+    """Identify compact Chinese copy embedded on the product/packaging area."""
+    width, height = image_size
+    box_width = max(1, hit.box[2] - hit.box[0])
+    box_height = max(1, hit.box[3] - hit.box[1])
+    center_y = (hit.box[1] + hit.box[3]) / 2
+    return (
+        len([char for char in hit.text if "\u3400" <= char <= "\u9fff"]) >= 2
+        and box_width <= width * 0.28
+        and box_height <= height * 0.08
+        and center_y >= height * 0.25
+    )
+
+
 @dataclass
 class ProcessingSummary:
     discovered: int = 0
@@ -140,6 +154,10 @@ class ImagePipeline:
             self.detector.last_watermark_diagnostics = []
             self.detector.last_remaining_hits = []
             source_ocr_hints = self.detector.scan(edited, minimum_confidence=0.35)
+            small_product_label_hits = tuple(
+                hit for hit in source_ocr_hints
+                if is_small_product_label_hit(hit, edited.size)
+            )
             vision_data = self.translator.vision_analyze_image(
                 source_path,
                 ocr_hints=[
@@ -187,7 +205,7 @@ class ImagePipeline:
                 return {
                     "status": "failed",
                     "retryable": False,
-                    "error": "自动排版可能遮挡商品，请人工确认",
+                    "error": "自动排版检测到译文区域越界、重叠或遮挡商品，请人工确认",
                     "quality_score": layout_quality.score,
                     "quality_reasons": list(layout_quality.reasons),
                 }
@@ -209,6 +227,10 @@ class ImagePipeline:
                 allow_repair=True,
                 translator=self.translator,
                 handled_boxes=handled_boxes,
+            )
+            unresolved_source_hits = tuple(
+                hit for hit in source_residual.remaining
+                if is_actionable_chinese_hit(hit)
             )
 
             # Enhancement (only upscale small images, preserve aspect)
@@ -249,8 +271,23 @@ class ImagePipeline:
             final_brand = self.detector.remove_brands_and_verify(final_residual.image)
             final = trim_near_white_border(final_brand.image)
 
-            # A generated JPEG is not a successful translation if unhandled
-            # Chinese remains after both repair passes.
+            # Verify and repair the exact public 800x800 artifact.  The old
+            # order checked a larger intermediate and then resized it, which
+            # let small/rotated package copy disappear from OCR telemetry while
+            # remaining visible to a person in the delivered file.
+            final = fit_to_output_canvas(final)
+            public_residual = self.detector.repair_and_verify(
+                final,
+                allow_repair=True,
+                translator=self.translator,
+            )
+            public_brand = self.detector.remove_brands_and_verify(public_residual.image)
+            final = public_brand.image
+
+            # A generated JPEG is not a successful translation if actionable
+            # Chinese remains after all three repair passes.  Mark it retryable
+            # so the durable queue can use its configured retry budget; Qwen
+            # and OCR occasionally resolve the same region on a later pass.
             remaining_chinese = tuple(
                 hit
                 for hit in self.detector.scan(final, minimum_confidence=0.35)
@@ -272,18 +309,50 @@ class ImagePipeline:
                 )
                 return {
                     "status": "failed",
-                    "retryable": False,
-                    "error": "译图仍存在未处理中文，请重试或人工确认",
+                    "retryable": True,
+                    "error": "译图仍存在未处理中文，系统将自动重试；多次失败后请人工确认",
                     "quality_score": 0.0,
                     "quality_reasons": ["residual_chinese"],
+                    "quality_details": {
+                        "remaining_regions": self.detector.last_remaining_hits,
+                    },
                 }
 
-            repaired_count = vision_repaired + len(source_residual.repaired) + len(final_residual.repaired)
-            removed_brand_count = len(source_brand.repaired) + len(final_brand.repaired)
-
-            # Standardize the public artifact only after all OCR/layout quality
-            # checks. This preserves content proportions and guarantees 800x800.
-            final = fit_to_output_canvas(final)
+            repaired_count = (
+                vision_repaired
+                + len(source_residual.repaired)
+                + len(final_residual.repaired)
+                + len(public_residual.repaired)
+            )
+            removed_brand_count = (
+                len(source_brand.repaired)
+                + len(final_brand.repaired)
+                + len(public_brand.repaired)
+            )
+            quality_reasons = list(layout_quality.reasons)
+            if unresolved_source_hits:
+                # The final OCR is clean, but source-scale OCR had ambiguous
+                # product-area fragments that could not be translated safely.
+                # Preserve the result for manual comparison instead of calling
+                # it an unconditional success or discarding it entirely.
+                quality_reasons.append("source_residual_requires_review")
+            if small_product_label_hits:
+                # OCR can read these labels in the source, but replacement on
+                # a curved/rotated product surface is not reliably verifiable
+                # after resizing. Keep the artifact downloadable and require a
+                # human comparison instead of reporting a false clean success.
+                quality_reasons.append("small_product_label_requires_review")
+            quality_reasons = list(dict.fromkeys(quality_reasons))
+            needs_review = (
+                layout_quality.needs_review
+                or bool(unresolved_source_hits)
+                or bool(small_product_label_hits)
+            )
+            quality_score = layout_quality.score
+            if unresolved_source_hits:
+                quality_score = min(quality_score, 0.6)
+            if small_product_label_hits:
+                quality_score = min(quality_score, 0.55)
 
             # Save output
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -295,9 +364,13 @@ class ImagePipeline:
                 "repaired_phrases": repaired_count,
                 "removed_brands": removed_brand_count,
                 "enhanced": enhancement.enhanced,
-                "quality_score": layout_quality.score,
-                "needs_review": layout_quality.needs_review,
-                "quality_reasons": list(layout_quality.reasons),
+                "quality_score": quality_score,
+                "needs_review": needs_review,
+                "quality_reasons": quality_reasons,
+                "review_message": (
+                    "源图艺术字或商品贴纸清理置信度不足，请对比确认"
+                    if needs_review else None
+                ),
             }
         except Exception as exc:
             LOGGER.exception("Failed to process %s", source_path)

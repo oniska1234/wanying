@@ -19,6 +19,7 @@ interface TaskInfo {
   total_count: number;
   done_count: number;
   failed_count: number;
+  review_count?: number;
   created_at: string;
 }
 
@@ -118,7 +119,7 @@ export default function ImageTranslate({
       const data = await res.json();
       if (!res.ok) { setError(data.error || "提交失败"); return; }
       setFiles([]);
-      setCurrentTask({ id: data.task_id, status: "processing", total_count: data.total, done_count: 0, failed_count: 0, created_at: new Date().toISOString(), items: [] });
+      setCurrentTask({ id: data.task_id, status: "processing", total_count: data.total, done_count: 0, failed_count: 0, review_count: 0, created_at: new Date().toISOString(), items: [] });
       startPolling(data.task_id);
     } catch {
       setError("服务器上传连接超时或响应中断，任务可能仍在后台处理；已自动刷新历史记录");
@@ -198,7 +199,11 @@ export default function ImageTranslate({
           <div className="mt-3 h-3 overflow-hidden rounded-full bg-surface">
             <div className={`h-full rounded-full transition-all ${currentTask.status === "failed" ? "bg-red-500" : "bg-accent"}`} style={{ width: `${progress}%` }} />
           </div>
-          <p className="mt-2 text-xs text-muted">完成 {currentTask.done_count} · 失败 {currentTask.failed_count} · 总计 {currentTask.total_count}</p>
+          <p className="mt-2 text-xs text-muted">
+            完成 {currentTask.done_count}
+            {(currentTask.review_count || 0) > 0 && `（其中 ${currentTask.review_count} 张需确认）`}
+            {` · 失败 ${currentTask.failed_count} · 总计 ${currentTask.total_count}`}
+          </p>
 
           {currentTask.items && currentTask.items.length > 0 && (
             <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -221,6 +226,14 @@ export default function ImageTranslate({
                       </button>
                     )}
                   </div>
+                  {item.status === "review" && (
+                    <p className="mt-2 rounded bg-amber-100 px-2 py-1 text-xs text-amber-800">
+                      需人工确认：{item.error || "源图文字清理置信度不足"}
+                    </p>
+                  )}
+                  {item.status === "failed" && item.error && (
+                    <p className="mt-2 text-xs text-red-500">{item.error}</p>
+                  )}
                 </div>
               ))}
             </div>
@@ -252,7 +265,11 @@ export default function ImageTranslate({
                 {history.map((t) => (
                   <tr key={t.id} className="border-b border-line/50">
                     <td className="py-2 pr-4"><StatusBadge status={t.status} /></td>
-                    <td className="py-2 pr-4">{t.done_count}/{t.total_count}{t.failed_count > 0 && <span className="text-red-500"> ({t.failed_count}失败)</span>}</td>
+                    <td className="py-2 pr-4">
+                      {t.done_count}/{t.total_count}
+                      {(t.review_count || 0) > 0 && <span className="text-amber-600"> ({t.review_count}需确认)</span>}
+                      {t.failed_count > 0 && <span className="text-red-500"> ({t.failed_count}失败)</span>}
+                    </td>
                     <td className="py-2 pr-4 text-xs text-muted">{new Date(t.created_at).toLocaleString("zh-CN")}</td>
                     <td className="py-2">
                       <button onClick={() => viewTask(t.id)} className="mr-2 text-xs text-accent hover:underline">查看</button>
@@ -400,6 +417,7 @@ function StatusBadge({ status }: { status: string }) {
     pending: { label: "等待中", cls: "bg-gray-100 text-gray-600" },
     processing: { label: "处理中", cls: "bg-amber-100 text-amber-700" },
     done: { label: "已完成", cls: "bg-green-100 text-green-700" },
+    review: { label: "需确认", cls: "bg-amber-100 text-amber-700" },
     failed: { label: "失败", cls: "bg-red-100 text-red-700" },
   };
   const s = map[status] || map.pending;

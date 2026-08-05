@@ -26,10 +26,25 @@ from config import FONT_REG
 from translator import MalayTranslator
 from layout_planner import plan_vertical_columns
 from quality_gate import assess_layout_diagnostics
+from pipeline import is_small_product_label_hit
 from brand_removal import BrandPolicy
 
 
 class RegionDeduplicationTests(unittest.TestCase):
+    def test_compact_chinese_in_product_area_requires_review(self) -> None:
+        hit = ChineseHit(
+            text="烟花水", confidence=0.99, box=(120, 450, 180, 480),
+            polygon=((120, 450), (180, 450), (180, 480), (120, 480)),
+        )
+        self.assertTrue(is_small_product_label_hit(hit, (800, 800)))
+
+    def test_large_headline_is_not_a_small_product_label(self) -> None:
+        hit = ChineseHit(
+            text="特色手柄设计", confidence=0.99, box=(80, 80, 720, 180),
+            polygon=((80, 80), (720, 80), (720, 180), (80, 180)),
+        )
+        self.assertFalse(is_small_product_label_hit(hit, (800, 800)))
+
     def test_overlap_uses_smaller_region_as_denominator(self) -> None:
         self.assertEqual(box_overlap_ratio((10, 10, 20, 20), (0, 0, 30, 30)), 1.0)
 
@@ -96,6 +111,40 @@ class RegionDeduplicationTests(unittest.TestCase):
 
 
 class TranslationQualityTests(unittest.TestCase):
+    def test_high_confidence_short_product_label_is_translated(self) -> None:
+        class StubTranslator:
+            @staticmethod
+            def translate_batch(texts: list[str]) -> dict[str, str]:
+                return {text: "Pistol air bunga api" for text in texts}
+
+            @staticmethod
+            def translate(text: str) -> str:
+                del text
+                return "Pistol air bunga api"
+
+        detector = ResidualChineseDetector.__new__(ResidualChineseDetector)
+        detector._brand_policy = BrandPolicy()
+        hit = ChineseHit(
+            text="烟花水", confidence=0.99, box=(120, 450, 180, 480),
+            polygon=((120, 450), (180, 450), (180, 480), (120, 480)),
+        )
+        replacements = detector._batch_translate_hits(
+            (hit,), StubTranslator(), image_size=(800, 800),
+        )
+        self.assertEqual(replacements, [(hit, "Pistol air bunga api")])
+
+    def test_low_confidence_short_central_fragment_stays_deferred(self) -> None:
+        detector = ResidualChineseDetector.__new__(ResidualChineseDetector)
+        detector._brand_policy = BrandPolicy()
+        hit = ChineseHit(
+            text="烟花水", confidence=0.75, box=(120, 450, 180, 480),
+            polygon=((120, 450), (180, 450), (180, 480), (120, 480)),
+        )
+        replacements = detector._batch_translate_hits(
+            (hit,), None, image_size=(800, 800),
+        )
+        self.assertEqual(replacements, [])
+
     def test_known_copy_overrides_long_vision_translation(self) -> None:
         translator = MalayTranslator()
         result = translator.validate_vision_translation(
@@ -373,7 +422,7 @@ class AdaptiveLayoutTests(unittest.TestCase):
         self.assertTrue(quality.severe)
         self.assertIn("translated_regions_overlap", quality.reasons)
 
-    def test_quality_gate_rejects_unclean_stylized_source(self) -> None:
+    def test_quality_gate_reviews_unclean_stylized_source_without_short_circuit(self) -> None:
         quality = assess_layout_diagnostics(
             [{
                 "confidence": 1.0,
@@ -384,7 +433,9 @@ class AdaptiveLayoutTests(unittest.TestCase):
             }],
             image_size=(500, 800),
         )
-        self.assertTrue(quality.severe)
+        self.assertFalse(quality.severe)
+        self.assertTrue(quality.needs_review)
+        self.assertLess(quality.score, 1.0)
         self.assertIn("source_cleanup_low_confidence", quality.reasons)
 
     def test_overlapping_horizontal_regions_are_merged(self) -> None:

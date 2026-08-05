@@ -29,8 +29,11 @@ Horizontal scale requires moving the queue to PostgreSQL or Redis first.
 - Overlapping horizontal rows of the same style are merged; different-colour
   header/body rows retain their styles and are split into non-overlapping boxes.
 - Non-Chinese package copy is not translated or erased.
-- Residual Chinese, unsafe translated-region overlap, or low-confidence layout
-  fails closed instead of returning a plausible but damaged image.
+- Unsafe translated-region overlap and out-of-bounds layout fail closed.
+- Low-confidence source cleanup continues through downstream repair and is
+  emitted as a downloadable `needs_review` result only when final OCR is clean.
+- Residual Chinese is checked on the exact 800x800 public artifact and consumes
+  the durable retry budget before becoming a terminal failure.
 - Seller watermarks that cross detected product foreground are rejected with a
   manual-processing reason. Classical inpainting is intentionally not used on
   these regions.
@@ -40,7 +43,8 @@ Horizontal scale requires moving the queue to PostgreSQL or Redis first.
 - `GET /health` reports worker readiness, queue depth, processing count, and
   OSS availability.
 - `GET /metrics` exposes queue depth, processing count, retries, average and P95
-  duration, terminal failures, and oldest pending age in Prometheus format.
+  duration, review outputs, terminal failures grouped by quality reason, and
+  oldest pending age in Prometheus format.
 - `GET /task/{task_id}` includes queue position and estimated wait time.
 
 Alert when any of the following persists:

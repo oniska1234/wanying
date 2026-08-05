@@ -444,6 +444,25 @@ class DurableQueue:
             oldest_enqueued_at = connection.execute(
                 "SELECT MIN(enqueued_at) FROM queue_items WHERE status = 'pending'"
             ).fetchone()[0]
+            terminal_results = connection.execute(
+                "SELECT status, result FROM queue_items "
+                "WHERE status IN ('success', 'failed')"
+            ).fetchall()
+
+        review_items = 0
+        failure_reasons: dict[str, int] = {}
+        for row in terminal_results:
+            try:
+                payload = json.loads(row["result"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if row["status"] == "success" and payload.get("needs_review"):
+                review_items += 1
+            if row["status"] == "failed":
+                reasons = payload.get("quality_reasons") or ["unclassified"]
+                for reason in reasons:
+                    key = str(reason or "unclassified")
+                    failure_reasons[key] = failure_reasons.get(key, 0) + 1
 
         def percentile(values: list[int], ratio: float) -> int:
             if not values:
@@ -465,6 +484,8 @@ class DurableQueue:
             "completed_samples": len(durations),
             "active_tasks": task_counts.get("pending", 0) + task_counts.get("processing", 0),
             "failed_items": item_counts.get("failed", 0),
+            "review_items": review_items,
+            "failure_reasons": failure_reasons,
             "oldest_pending_seconds": round(
                 max(0.0, time.time() - float(oldest_enqueued_at)), 1
             ) if oldest_enqueued_at else 0.0,

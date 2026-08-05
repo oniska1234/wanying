@@ -16,10 +16,10 @@ const MAX_FILES = 50;
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB per file
 const MAX_TOTAL_SIZE = 50 * 1024 * 1024; // 50MB per task
 const ALLOWED_EXT = new Set([".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"]);
-// Keep cross-region OSS traffic below the point where individual PUT requests
-// regularly hit the SDK timeout. Translation concurrency is handled by the
-// durable Python queue and is independent from this number.
-const UPLOAD_CONCURRENCY = 3;
+// The application and OSS bucket are both in Shenzhen. Five parallel PUTs
+// improve batch upload latency while the 50MB request cap keeps memory and
+// outbound bandwidth bounded. Translation concurrency remains independent.
+const UPLOAD_CONCURRENCY = 5;
 
 // Magic bytes for image validation
 const MAGIC_BYTES: Array<{ ext: string[]; bytes: number[] }> = [

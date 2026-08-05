@@ -52,9 +52,11 @@ export async function GET(req: NextRequest, { params }: Props) {
             if (r.file === "*") continue;
             // Match item by sourceKey ending with the result filename
             const item = task.items.find((i) => i.sourceKey?.endsWith(r.file));
-            const targetStatus = r.status === "success" ? "success" : "failed";
+            const targetStatus = r.status === "success"
+              ? r.needs_review ? "review" : "success"
+              : "failed";
             const targetOutputKey = r.output_key || null;
-            const targetError = r.error || null;
+            const targetError = r.error || r.review_message || null;
             if (
               item &&
               (item.status !== targetStatus ||
@@ -98,6 +100,7 @@ export async function GET(req: NextRequest, { params }: Props) {
 
   // Re-fetch items after potential update
   const items = await prisma.imageTranslateHighItem.findMany({ where: { taskId: id } });
+  const reviewCount = items.filter((item) => item.status === "review").length;
 
   return NextResponse.json({
     id: task.id,
@@ -105,6 +108,7 @@ export async function GET(req: NextRequest, { params }: Props) {
     total_count: task.totalCount,
     done_count: task.doneCount,
     failed_count: task.failedCount,
+    review_count: reviewCount,
     created_at: task.createdAt.toISOString(),
     items: items.map((i) => ({
       id: i.id,

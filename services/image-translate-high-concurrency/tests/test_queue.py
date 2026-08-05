@@ -107,6 +107,38 @@ class DurableQueueTests(unittest.TestCase):
         self.assertEqual(task["status"], "failed")
         self.assertEqual(task["failed"], 1)
 
+        metrics = self.queue.metrics()
+        self.assertEqual(metrics["failure_reasons"], {"unclassified": 1})
+
+    def test_metrics_count_review_outputs_and_failure_reasons(self) -> None:
+        self.enqueue("task-review", "user-review", 2)
+        review = self.queue.claim_next_item()
+        assert review is not None
+        self.queue.complete_item(
+            review,
+            {
+                "output_key": "review.jpg",
+                "needs_review": True,
+                "quality_reasons": ["source_cleanup_low_confidence"],
+            },
+            duration_ms=10,
+        )
+        failed = self.queue.claim_next_item()
+        assert failed is not None
+        self.queue.fail_or_retry_item(
+            failed,
+            "residual",
+            retryable=False,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            duration_ms=10,
+            details={"quality_reasons": ["residual_chinese"]},
+        )
+
+        metrics = self.queue.metrics()
+        self.assertEqual(metrics["review_items"], 1)
+        self.assertEqual(metrics["failure_reasons"], {"residual_chinese": 1})
+
     def test_capacity_and_per_user_limits_are_enforced(self) -> None:
         self.enqueue("task-a", "user-a", 2)
         with self.assertRaises(UserTaskLimitError):

@@ -1027,13 +1027,14 @@ class ResidualChineseDetector:
             if (
                 len(normalized) <= 3
                 and re.fullmatch(r"[㐀-䶿一-鿿]+", normalized)
+                and hit.confidence < 0.90
                 and image_size[1] * 0.25 <= center_y <= image_size[1] * 0.75
                 and hit.box[3] - hit.box[1] >= image_size[1] * 0.015
             ):
-                # A short, isolated, pale OCR fragment in the product area is
+                # A short, isolated, lower-confidence OCR fragment in the product area is
                 # commonly the only readable part of a long seller watermark.
-                # Do not turn it into plausible-looking but wrong Malay copy;
-                # leaving it unresolved makes the final gate fail closed.
+                # High-confidence short product labels are legitimate copy and
+                # must continue to translation instead of failing forever.
                 LOGGER.warning(
                     "Deferred ambiguous central OCR fragment text=%s box=%s",
                     hit.text,
