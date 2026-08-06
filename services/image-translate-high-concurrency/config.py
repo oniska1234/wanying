@@ -71,8 +71,8 @@ OSS_PREFIX = os.environ.get(
 ).strip().strip("/") or "image-translate"
 PIPELINE_CACHE_VERSION = os.environ.get(
     "IMAGE_TRANSLATE_PIPELINE_CACHE_VERSION",
-    "latency-v1",
-).strip() or "latency-v1"
+    "font-v2",
+).strip() or "font-v2"
 
 # Processing limits
 MAX_IMAGES_PER_TASK = 50

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFont
 
 from ocr_detector import (
     ChineseHit,
@@ -21,6 +21,7 @@ from ocr_detector import (
     _render_rotated,
     _render_stacked_vertical_words,
     _merge_overlapping_horizontal_tasks,
+    _render_horizontal,
 )
 from config import FONT_REG
 from translator import MalayTranslator
@@ -311,6 +312,26 @@ class TranslationQualityTests(unittest.TestCase):
 
 
 class RenderingAndInpaintTests(unittest.TestCase):
+    def test_horizontal_malay_copy_is_visually_enlarged_without_overflow(self) -> None:
+        image = Image.new("RGB", (320, 100), "white")
+        font = ImageFont.truetype(str(FONT_REG), size=36)
+        _render_horizontal(
+            image,
+            (20, 20, 300, 80),
+            "Maklumat produk",
+            font,
+            (20, 20, 20),
+            36,
+            allow_wrap=False,
+        )
+        ink = np.any(np.asarray(image) < 245, axis=2)
+        ys, xs = np.where(ink)
+        self.assertGreaterEqual(ys.max() - ys.min() + 1, 27)
+        self.assertGreaterEqual(xs.min(), 20)
+        self.assertLessEqual(xs.max(), 299)
+        self.assertGreaterEqual(ys.min(), 20)
+        self.assertLessEqual(ys.max(), 79)
+
     def test_low_contrast_pastel_text_is_darkened_for_small_badge(self) -> None:
         image = Image.new("RGB", (300, 100), (180, 230, 235))
         original = (100, 195, 200)

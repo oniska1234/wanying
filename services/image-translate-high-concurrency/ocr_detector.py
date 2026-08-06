@@ -29,6 +29,8 @@ CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 TRANSLATION_BOX_SCALE = 1.18
 TRANSLATION_FONT_MAX_SIZE = 80
 MIN_READABLE_FONT_SIZE = 18
+TRANSLATION_VISUAL_SCALE = 1.16
+MIN_HORIZONTAL_TEXT_SCALE = 0.84
 
 
 @dataclass(frozen=True)
@@ -690,20 +692,68 @@ def _render_horizontal(
     text = best_text
     size = best_size
 
-    try:
-        fnt = ImageFont.truetype(str(FONT_BOLD), size=size)
-    except OSError:
-        fnt = ImageFont.load_default()
+    # Malay copy is usually longer than its Chinese source. Increase visual
+    # height and, only when needed, condense the rendered Latin text slightly
+    # along the horizontal axis. This keeps the complete translation inside
+    # the original region while making it materially easier to read.
+    selected_size = size
+    selected_font = fnt
+    selected_bbox = draw.multiline_textbbox(
+        (0, 0), text, font=fnt, spacing=max(2, size // 8), align="center",
+    )
+    upper_size = max(size, round(size * TRANSLATION_VISUAL_SCALE))
+    for candidate_size in range(upper_size, size - 1, -1):
+        try:
+            candidate_font = ImageFont.truetype(str(FONT_BOLD), size=candidate_size)
+        except OSError:
+            candidate_font = ImageFont.load_default()
+        candidate_spacing = max(2, candidate_size // 8)
+        candidate_bbox = draw.multiline_textbbox(
+            (0, 0), text, font=candidate_font,
+            spacing=candidate_spacing, align="center",
+        )
+        candidate_width = candidate_bbox[2] - candidate_bbox[0]
+        candidate_height = candidate_bbox[3] - candidate_bbox[1]
+        required_horizontal_scale = min(
+            1.0,
+            max(1, box_w - 4) / max(1, candidate_width + 4),
+        )
+        if (
+            candidate_height + 4 <= box_h
+            and required_horizontal_scale >= MIN_HORIZONTAL_TEXT_SCALE
+        ):
+            selected_size = candidate_size
+            selected_font = candidate_font
+            selected_bbox = candidate_bbox
+            break
 
-    spacing = max(2, size // 8)
-    bbox = draw.multiline_textbbox((0, 0), text, font=fnt, spacing=spacing)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    spacing = max(2, selected_size // 8)
+    tw = math.ceil(selected_bbox[2] - selected_bbox[0])
+    th = math.ceil(selected_bbox[3] - selected_bbox[1])
+    padding = 2
+    text_layer = Image.new(
+        "RGBA", (max(1, tw + padding * 2), max(1, th + padding * 2)),
+        (0, 0, 0, 0),
+    )
+    layer_draw = ImageDraw.Draw(text_layer)
+    layer_draw.multiline_text(
+        (padding - selected_bbox[0], padding - selected_bbox[1]),
+        text,
+        font=selected_font,
+        fill=color + (255,),
+        spacing=spacing,
+        align="center",
+    )
+    available_width = max(1, box_w - 4)
+    if text_layer.width > available_width:
+        target_width = max(1, available_width)
+        text_layer = text_layer.resize(
+            (target_width, text_layer.height), Image.Resampling.LANCZOS,
+        )
 
-    # Center in box
-    tx = x1 + (box_w - tw) // 2
-    ty = y1 + (box_h - th) // 2
-
-    draw.multiline_text((tx, ty), text, font=fnt, fill=color, spacing=spacing, align="center")
+    tx = x1 + (box_w - text_layer.width) // 2
+    ty = y1 + (box_h - text_layer.height) // 2
+    image.paste(text_layer, (tx, ty), text_layer)
 
 
 def _render_rotated(
